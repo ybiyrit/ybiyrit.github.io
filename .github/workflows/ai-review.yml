@@ -36,7 +36,7 @@ jobs:
             echo "ok=false" >> "$GITHUB_OUTPUT"
             echo "::notice::No CLAUDE_CODE_OAUTH_TOKEN secret; skipping Claude review"
           fi
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         if: steps.creds.outputs.ok == 'true'
         with:
           fetch-depth: 1
