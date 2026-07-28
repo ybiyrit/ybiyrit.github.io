@@ -36,15 +36,15 @@ jobs:
             echo "ok=false" >> "$GITHUB_OUTPUT"
             echo "::notice::No CLAUDE_CODE_OAUTH_TOKEN secret; skipping Claude review"
           fi
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         if: steps.creds.outputs.ok == 'true'
         with:
           fetch-depth: 1
-      - uses: anthropics/claude-code-action@beta
+      - uses: anthropics/claude-code-action@e90deca47693f9457b72f2b53c17d7c445a87342 # v1.0.171
         if: steps.creds.outputs.ok == 'true'
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          direct_prompt: |
+          prompt: |
             Review this PR. Focus on correctness, security risks, design
             coherence with surrounding code, and unresolved TODOs. Post
             concise line comments where useful.
