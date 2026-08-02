@@ -19,10 +19,12 @@
 #   bare      pinned SHA with no `# vX.Y.Z` comment - immutable but unreadable,
 #             so nobody can tell whether the pin has gone stale
 #
-# Local actions (`./path`) and reusable workflows (`org/repo/.github/...@sha`)
-# are covered by the same rule; docker:// refs are skipped as out of scope.
+# Reusable workflows (`org/repo/.github/...@sha`) carry a ref and are held to
+# the same rule. Local actions (`./path`) and docker:// refs are skipped: the
+# first names a path inside this repo and has no ref to pin, the second is a
+# registry reference outside the scope of the convention.
 #
-# Usage:
+# Usage (path as this repo keeps it, see above):
 #   bash bin/check-action-pins.sh                 # this repo
 #   bash bin/check-action-pins.sh --all-repos     # every sibling repo in ~/src/ybiyrit
 #   bash bin/check-action-pins.sh --strict        # bare pins fail too, not just warn
@@ -31,10 +33,14 @@ set -o errexit -o nounset -o pipefail -o errtrace
 IFS=$'\n\t'
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-# git decides the root, so bin/ and .github/scripts/ copies behave identically;
-# the parent-directory fallback covers a copy run outside a checkout.
+# git decides the root, so bin/ and .github/scripts/ copies behave identically.
+# Outside a checkout there is no git to ask, so fall back on the two locations
+# this file is kept in - .github/scripts/ sits two levels down, bin/ one.
 if ! REPO_ROOT="$(git -C "${SCRIPT_DIR}" rev-parse --show-toplevel 2>/dev/null)"; then
-    REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+    case "${SCRIPT_DIR}" in
+        */.github/scripts) REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)" ;;
+        *)                 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)" ;;
+    esac
 fi
 WORKSPACE_ROOT="$(cd "${REPO_ROOT}/.." && pwd)"
 
@@ -72,6 +78,11 @@ check_file() {
         # strip everything up to and including `uses:` plus surrounding space
         ref="${ref#*uses:}"
         ref="${ref#"${ref%%[![:space:]]*}"}"
+        # `uses: "actions/checkout@<sha>" # v4.4.0` is legal YAML. Left in, the
+        # closing quote reads as part of the ref and a valid pin is reported as
+        # a mutable tag, so the gate fails on correct input.
+        ref="${ref//\"/}"
+        ref="${ref//\'/}"
 
         case "$ref" in
             docker://*|./*)

@@ -10,7 +10,10 @@ name: Action pins
 # Why it cannot be left to Dependabot: Dependabot bumps versions, it does not
 # police pinning style. A PR reintroducing `uses: actions/checkout@v4` is valid
 # input to it - it would keep bumping that tag and never flag the mutability.
-# The check here is also cheap and offline, needing no token and no network.
+# The check itself is cheap: once the tree is checked out it only reads files,
+# with no API token of its own and no network calls. The job around it is the
+# ordinary one, actions/checkout with the default GITHUB_TOKEN at contents:
+# read.
 #
 # The script distinguishes mutable tags from empty refs (`uses: foo@`), which
 # are valid YAML and fail only at run time. That is not a hypothetical: an
