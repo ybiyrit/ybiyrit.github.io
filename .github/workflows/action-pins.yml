@@ -1,0 +1,48 @@
+name: Action pins
+# Enforces research-general conventions/tech-stack-and-versions.md section 3.1:
+# every `uses:` line references a 40-character commit SHA, not a tag.
+#
+# Why this exists as a gate rather than a habit: the convention has required
+# SHA pinning for as long as it has existed, and the workspace still drifted to
+# 20+ mutable refs across nine repos, including a release action running with
+# contents: write. Nothing was enforcing it.
+#
+# Why it cannot be left to Dependabot: Dependabot bumps versions, it does not
+# police pinning style. A PR reintroducing `uses: actions/checkout@v4` is valid
+# input to it - it would keep bumping that tag and never flag the mutability.
+# The check here is also cheap and offline, needing no token and no network.
+#
+# The script distinguishes mutable tags from empty refs (`uses: foo@`), which
+# are valid YAML and fail only at run time. That is not a hypothetical: an
+# unset shell variable in the pinning sweep produced exactly that, and the
+# YAML parser accepted it.
+#
+# Runs on any pull request, not only ones touching .github/, so a workflow
+# added on a branch cannot slip in unpinned via an unrelated path filter.
+#
+# The script is a verbatim copy of research-general bin/check-action-pins.sh;
+# change it there first, then re-copy. It resolves its own repo root, so the
+# copy behaves identically wherever the repo keeps it.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  push:
+    branches: [main]
+
+concurrency:
+  group: action-pins-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: action pins
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: "check every uses: ref is a pinned SHA"
+        run: bash .github/scripts/check-action-pins.sh
