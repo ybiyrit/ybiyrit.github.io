@@ -1,0 +1,297 @@
+#!/usr/bin/env bash
+# shellcheck shell=bash
+# pre-push hook v1.3 created 2605 cl-bs updated 2608 cl-bs
+#
+# universal pre-push guard. two independent checks, both fail closed:
+#
+#   1. remote URL: reject a push to a remote whose URL embeds a credential
+#      or token shape. catches a URL added to .git/config in a prior
+#      session or by another tool. canonical patterns mirror
+#      ~/.claude/hooks/block-dangerous-commands.sh.
+#   2. payload: reject a push whose commits ADD secret-shaped content or a
+#      secret-shaped filename. personal identifiers (email, phone, private
+#      address, rfc1918 host) are reported as a warning, not a block: a
+#      personal dotfiles repo legitimately carries the owner's name and
+#      home paths, so blocking on those would make the hook unusable.
+#
+# this file is the MASTER. `dotfiles.sh git-hooks --apply` mirrors it into
+# every discovered repo's .githooks/ and sets core.hooksPath, so extending
+# the catalogue here extends it everywhere. keep it self-contained: it runs
+# inside repos that cannot see ~/bin.
+#
+# install: git config core.hooksPath .githooks   (per clone; dotfiles.sh does it)
+# bypass:  git push --no-verify   (git itself; nothing here can prevent that)
+set -o errexit -o nounset -o pipefail -o errtrace
+IFS=$'\n\t'
+
+# newest commits scanned per ref update. a first push to an empty remote
+# would otherwise walk the entire history; the cap is reported, never silent.
+readonly MAX_COMMITS=1000
+
+# git always passes both args during a real push: $1 = remote name, $2 = remote
+# URL. when invoked manually with no args (e.g. `bash .githooks/pre-push`),
+# print a brief usage and exit 0; a clean no-op rather than a silent
+# fallback that would check `origin` and mask which remote was intended.
+if [[ "$#" -eq 0 ]]; then
+    printf '[info] pre-push: usage: %s <remote-name> <remote-url>\n' "$(basename "$0")" >&2
+    printf '[info] invoked manually with no args; nothing to check.\n' >&2
+    exit 0
+fi
+
+REMOTE_NAME="${1}"
+REMOTE_URL_ARG="${2:-}"
+
+# buffer the ref updates before anything else. git feeds them on stdin as
+# `<local-ref> <local-sha> <remote-ref> <remote-sha>` and they can only be
+# read once; the payload scan needs them, and git-lfs needs them replayed
+# verbatim if we chain to it at the end.
+REF_UPDATES=""
+if [[ ! -t 0 ]]; then
+    REF_UPDATES="$(cat || true)"
+fi
+
+# fall back to `git remote get-url` when $2 is empty (rare, but handles
+# tools that pass only the remote name).
+REMOTE_URL="${REMOTE_URL_ARG}"
+if [[ -z "${REMOTE_URL}" ]]; then
+    REMOTE_URL="$(git remote get-url "${REMOTE_NAME}" 2>/dev/null || true)"
+fi
+
+# check 1: remote URL
+
+DANGEROUS_URL_PATTERNS=(
+  # known token formats inside an https URL userinfo segment
+  'https?://[^[:space:]/@]*(gho_|ghp_|github_pat_|glpat-)[A-Za-z0-9_-]+@'
+
+  # generic https basic-auth (user:password@); legitimate auth in 2026
+  # uses credential helpers (libsecret) or ssh, never inline
+  'https?://[^[:space:]/@]+:[^[:space:]/@]+@'
+
+  # percent-encoded character anywhere in the userinfo segment.
+  # legitimate userinfos rarely percent-encode; abuse pattern is to encode
+  # the first byte of a token prefix (`%67ho_xxx` for `gho_xxx`) to evade
+  # literal-prefix matchers. block conservatively.
+  #
+  # the [/][/] spelling is deliberate: this line is the one URL pattern the
+  # basic-auth CONTENT pattern above would otherwise match, which blocked
+  # the push that adds this hook. inert in the regex, breaks the self-match.
+  'https?:[/][/][^[:space:]@]*%[a-fA-F0-9]{2}[^[:space:]@]*@'
+
+  # env-var indirection in userinfo (`https://${TOKEN}@host`,
+  # `https://$TOKEN@host`). either the var resolves to a token at push
+  # time (leak vehicle) or the URL is malformed; both cases warrant
+  # blocking.
+  'https?://[^[:space:]/@]*\$\{?[A-Za-z_][^[:space:]/@]*@'
+)
+
+if [[ -n "${REMOTE_URL}" ]]; then
+    for PATTERN in "${DANGEROUS_URL_PATTERNS[@]}"; do
+        if printf '%s' "${REMOTE_URL}" | grep -qE -- "${PATTERN}"; then
+            printf '[error] pre-push: remote URL embeds a credential or token shape\n' >&2
+            printf '[error]   remote:  %s\n' "${REMOTE_NAME}" >&2
+            printf '[error]   url:     %s\n' "${REMOTE_URL}" >&2
+            printf '[error]   pattern: %s\n' "${PATTERN}" >&2
+            printf '[error] use credential.helper (libsecret) or ssh; rotate any leaked\n' >&2
+            printf '[error] token at the issuer immediately if it has been pushed.\n' >&2
+            exit 1
+        fi
+    done
+fi
+
+# check 2: payload
+
+# secret-shaped CONTENT. specific by design: a false positive blocks a
+# push, so breadth belongs in the advisory list, not here.
+#
+# every pattern must be written so it does not match its own source line:
+# this file is itself pushed through the hook, and a pattern that matches
+# the catalogue that defines it blocks the commit that adds the hook. two
+# did. a bracket around one literal character ([-] for -, [/] for /) is
+# inert in the regex and breaks the self-match.
+SECRET_CONTENT_PATTERNS=(
+    'gh[pousr]_[A-Za-z0-9]{36,}'
+    'github_pat_[A-Za-z0-9_]{82,}'
+    'glpat-[A-Za-z0-9_-]{20,}'
+    'AKIA[0-9A-Z]{16}'
+    'AIza[0-9A-Za-z_-]{35}'
+    'sk-ant-[A-Za-z0-9_-]{20,}'
+    'sk-[A-Za-z0-9]{32,}'
+    'xox[baprs]-[A-Za-z0-9-]{10,}'
+    '-----BEGIN ([A-Z]+ )?PRIVATE KEY-----'
+    'PuTTY-User-Key-File[-]'
+    # jwt: three base64url segments
+    'eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}'
+    # basic-auth credentials inside any URL
+    ':[/][/][^[:space:]/@]+:[^[:space:]/@]+@'
+)
+
+# files that DEFINE or TEST the catalogue above, excluded from the CONTENT
+# scan only.
+#
+# the bracket evasion protects the CURRENT text of this file, but the scan
+# walks `git log -p` over the whole push range, and every earlier revision in
+# that range still carries the pre-evasion spelling. so the hook blocks its
+# own history permanently: v1.2 ("stop the hook blocking its own adoption")
+# fixed the tip and the push stayed blocked, which is how ~/config reached 85
+# unpushed commits and ~/bin 80.
+#
+# the exclusion is narrow by design. it drops content matching for five
+# known catalogue and fixture paths; the FILENAME scan below still covers
+# them, and every other path in the repo is scanned exactly as before. a real
+# credential pasted into one of these five files would be missed, which is
+# the accepted cost of a catalogue that can describe itself.
+SCAN_EXCLUDE_PATHS=(
+    ':(exclude,glob)**/.githooks/pre-push'
+    ':(exclude,glob)**/.githooks/test-pre-push.sh'
+    ':(exclude,glob)**/hooks/block-dangerous-commands.sh'
+    ':(exclude,glob)**/hooks/test-block-dangerous-commands.sh'
+    ':(exclude,glob)**/pack-harness.sh'
+)
+
+# secret-shaped FILENAMES and restricted stores. a file whose name says
+# "private key" is a leak regardless of what the content scan makes of it.
+readonly SECRET_PATH_PATTERN='(^|/)(id_rsa|id_ed25519|id_ecdsa|\.netrc|credentials\.json)$|\.(pem|key|p12|pfx|jks|keystore|kdbx|ovpn|token)$|(^|/)\.(env|secret)$|\.secret$|(^|/)(ssh|\.ssh|\.password-store|\.gnupg|\.gpg|\.cert|\.pki|\.dat)/|(ssh|gpg|git)\.zip$'
+
+# personal identifiers. ADVISORY: reported, never blocking.
+PII_PATTERNS=(
+    '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}'
+    '\+49[0-9 /-]{8,}'
+    '\b(10|192\.168|172\.(1[6-9]|2[0-9]|3[01]))\.[0-9]{1,3}\.[0-9]{1,3}\b'
+)
+
+# collect the rev ranges this push would publish.
+RANGES=()
+SKIPPED_NOTE=""
+# IFS must be a space for this read: git separates the four fields with
+# spaces, and the strict-mode IFS=$'\n\t' above would put the whole line
+# into the first variable and leave every sha empty (a silently empty
+# range that scans nothing and passes everything).
+while IFS=' ' read -r _LOCAL_REF LOCAL_SHA _REMOTE_REF REMOTE_SHA; do
+    # deletion: the local side is all zeros, nothing is published.
+    [[ "${LOCAL_SHA}" =~ ^0+$ ]] && continue
+    if [[ "${REMOTE_SHA}" =~ ^0+$ ]]; then
+        # new ref: everything reachable from it that no other remote-tracking
+        # branch already has. on a first push to an empty remote that is the
+        # whole history, hence the cap below.
+        RANGES+=("${LOCAL_SHA}|--not|--remotes")
+    else
+        RANGES+=("${REMOTE_SHA}..${LOCAL_SHA}|")
+    fi
+done <<< "${REF_UPDATES}"
+
+if [[ "${#RANGES[@]}" -eq 0 ]]; then
+    exit 0
+fi
+
+printf '[info] pre-push: scanning %d ref update(s) to %s\n' "${#RANGES[@]}" "${REMOTE_NAME}" >&2
+
+FOUND=0
+PII_REPORT=""
+for RANGE in "${RANGES[@]}"; do
+    # split the packed "revs|extra-args" entry back into git arguments
+    IFS='|' read -r -a REV_ARGS <<< "${RANGE}"
+    ARGS=()
+    for A in "${REV_ARGS[@]}"; do
+        [[ -n "${A}" ]] && ARGS+=("${A}")
+    done
+    [[ "${#ARGS[@]}" -eq 0 ]] && continue
+
+    COUNT="$(git rev-list --count "${ARGS[@]}" 2>/dev/null || printf '0')"
+    [[ "${COUNT}" -eq 0 ]] && continue
+    LIMIT=()
+    if [[ "${COUNT}" -gt "${MAX_COMMITS}" ]]; then
+        LIMIT=(--max-count="${MAX_COMMITS}")
+        SKIPPED_NOTE="${SKIPPED_NOTE}${SKIPPED_NOTE:+; }$(( COUNT - MAX_COMMITS )) older commit(s) in ${ARGS[0]} not scanned"
+    fi
+
+    # one walk per range. -p over the range (rather than a squashed diff)
+    # still catches a secret added in one commit and removed in a later
+    # one: both remain in the published history.
+    ADDED="$(git log -p --no-color --no-merges --unified=0 "${LIMIT[@]}" "${ARGS[@]}" \
+        -- . "${SCAN_EXCLUDE_PATHS[@]}" 2>/dev/null \
+        | grep -E '^\+' | grep -vE '^\+\+\+' || true)"
+
+    if [[ -n "${ADDED}" ]]; then
+        for PATTERN in "${SECRET_CONTENT_PATTERNS[@]}"; do
+            HITS="$(printf '%s\n' "${ADDED}" | grep -oE -- "${PATTERN}" | sort -u || true)"
+            [[ -z "${HITS}" ]] && continue
+            printf '[error] pre-push: secret-shaped content added, pattern: %s\n' "${PATTERN}" >&2
+            while IFS= read -r HIT; do
+                # redact: enough to identify the hit, not enough to reuse it
+                if [[ "${#HIT}" -le 8 ]]; then
+                    printf '[error]   match: %s\n' "${HIT}" >&2
+                else
+                    printf '[error]   match: %s...%s\n' "${HIT:0:4}" "${HIT: -4}" >&2
+                fi
+            done <<< "${HITS}"
+            FOUND=$(( FOUND + 1 ))
+        done
+
+        for PATTERN in "${PII_PATTERNS[@]}"; do
+            HITS="$(printf '%s\n' "${ADDED}" | grep -oE -- "${PATTERN}" | sort -u || true)"
+            [[ -n "${HITS}" ]] && PII_REPORT="${PII_REPORT}${HITS}"$'\n'
+        done
+    fi
+
+    # filenames, independent of content
+    PATHS="$(git log --name-only --pretty=format: --no-merges "${LIMIT[@]}" "${ARGS[@]}" 2>/dev/null \
+        | sort -u | grep -vE '^$' || true)"
+    if [[ -n "${PATHS}" ]]; then
+        # name what the content scan did not read, so an exclusion never
+        # reads as clean coverage
+        SKIPPED_CONTENT="$(printf '%s\n' "${PATHS}" \
+            | grep -E -- '(^|/)(\.githooks/pre-push|\.githooks/test-pre-push\.sh|pack-harness\.sh)$|/hooks/(test-)?block-dangerous-commands\.sh$' || true)"
+        if [[ -n "${SKIPPED_CONTENT}" ]]; then
+            printf '[info] pre-push: catalogue source(s) in this push, content scan skipped for:\n' >&2
+            printf '%s\n' "${SKIPPED_CONTENT}" | sed 's/^/[info]   /' >&2
+        fi
+
+        BAD_PATHS="$(printf '%s\n' "${PATHS}" | grep -E -- "${SECRET_PATH_PATTERN}" || true)"
+        if [[ -n "${BAD_PATHS}" ]]; then
+            printf '[error] pre-push: secret-shaped path(s) in this push:\n' >&2
+            printf '%s\n' "${BAD_PATHS}" | sed 's/^/[error]   /' >&2
+            FOUND=$(( FOUND + 1 ))
+        fi
+    fi
+done
+
+if [[ -n "${SKIPPED_NOTE}" ]]; then
+    printf '[warn] pre-push: scan capped at %d commits per ref (%s)\n' "${MAX_COMMITS}" "${SKIPPED_NOTE}" >&2
+fi
+
+if [[ -n "${PII_REPORT}" ]]; then
+    PII_UNIQUE="$(printf '%s' "${PII_REPORT}" | grep -vE '^$' | sort -u || true)"
+    if [[ -n "${PII_UNIQUE}" ]]; then
+        printf '[warn] pre-push: personal identifier(s) in this push (advisory, not blocking):\n' >&2
+        printf '%s\n' "${PII_UNIQUE}" | head -20 | sed 's/^/[warn]   /' >&2
+        printf '[warn] confirm the target remote is private before publishing these.\n' >&2
+    fi
+fi
+
+if (( FOUND > 0 )); then
+    printf '[error] pre-push blocked: %d finding(s).\n' "${FOUND}" >&2
+    printf '[info]  rotate any real credential at its issuer FIRST; a push that\n' >&2
+    printf '[info]  already happened cannot be recalled, and history rewriting\n' >&2
+    printf '[info]  does not un-leak it.\n' >&2
+    printf '[info]  for fixtures, replace the value with an obvious placeholder.\n' >&2
+    exit 1
+fi
+
+printf '[pass] pre-push: no secret-shaped content or path detected\n' >&2
+
+# chain to git-lfs pre-push if the repo uses LFS. preserves the LFS-installed
+# pre-push behaviour (the hook git-lfs writes when `git lfs install` runs)
+# while keeping the security check ahead of it. the buffered ref updates are
+# replayed on its stdin, since this hook already consumed them. if either
+# side is missing, this block is a no-op (security check is sufficient).
+if command -v git-lfs >/dev/null 2>&1; then
+    if git config --get-regexp '^lfs\.' >/dev/null 2>&1 \
+       || (git rev-parse --show-toplevel >/dev/null 2>&1 \
+           && [[ -f "$(git rev-parse --show-toplevel)/.gitattributes" ]] \
+           && grep -q "filter=lfs" "$(git rev-parse --show-toplevel)/.gitattributes"); then
+        printf '%s\n' "${REF_UPDATES}" | git lfs pre-push "$@"
+        exit $?
+    fi
+fi
+
+exit 0
