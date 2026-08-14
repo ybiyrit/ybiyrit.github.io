@@ -1,8 +1,13 @@
 #!/usr/bin/env bash
 # shellcheck shell=bash
-# pre-push hook v1.3 created 2605 cl-bs updated 2608 cl-bs
+# pre-push hook v1.4 created 2605 cl-bs updated 2608 cl-bs
 #
 # universal pre-push guard. two independent checks, both fail closed:
+#
+# "fail closed" is load-bearing and was not true before v1.4: an errored git
+# command, an unresolvable remote URL, and an empty ref-update list each read
+# as "found nothing" and passed the push. every such path now aborts via
+# guard_abort. found by review on claude-bocuse#3.
 #
 #   1. remote URL: reject a push to a remote whose URL embeds a credential
 #      or token shape. catches a URL added to .git/config in a prior
@@ -27,6 +32,18 @@ IFS=$'\n\t'
 # newest commits scanned per ref update. a first push to an empty remote
 # would otherwise walk the entire history; the cap is reported, never silent.
 readonly MAX_COMMITS=1000
+
+# fail closed. every git invocation below feeds a security decision, so a
+# command that ERRORS must not be read as "found nothing": that inverts the
+# guard into a pass. `2>/dev/null || true` on a scan is the same defect as an
+# empty match set. called with a reason; never returns.
+guard_abort() {
+    printf '[error] pre-push: cannot verify this push, refusing it\n' >&2
+    printf '[error]   reason: %s\n' "${1}" >&2
+    printf '[info]  this is fail-closed by design. re-run once the repository\n' >&2
+    printf '[info]  state is readable, or bypass deliberately with --no-verify.\n' >&2
+    exit 1
+}
 
 # git always passes both args during a real push: $1 = remote name, $2 = remote
 # URL. when invoked manually with no args (e.g. `bash .githooks/pre-push`),
@@ -83,6 +100,12 @@ DANGEROUS_URL_PATTERNS=(
   # blocking.
   'https?://[^[:space:]/@]*\$\{?[A-Za-z_][^[:space:]/@]*@'
 )
+
+# an unresolvable remote URL is not a pass: check 1 cannot run, and the whole
+# point of it is that the URL may be the leak. refuse rather than skip.
+if [[ -z "${REMOTE_URL}" ]]; then
+    guard_abort "remote '${REMOTE_NAME}' has no resolvable URL, so the URL check cannot run"
+fi
 
 if [[ -n "${REMOTE_URL}" ]]; then
     for PATTERN in "${DANGEROUS_URL_PATTERNS[@]}"; do
@@ -167,6 +190,10 @@ SKIPPED_NOTE=""
 # into the first variable and leave every sha empty (a silently empty
 # range that scans nothing and passes everything).
 while IFS=' ' read -r _LOCAL_REF LOCAL_SHA _REMOTE_REF REMOTE_SHA; do
+    # a here-string of the empty string still yields ONE iteration, so an empty
+    # REF_UPDATES would otherwise fabricate a range of "..", which rev-list
+    # rejects and which used to be swallowed as "nothing to scan".
+    [[ -z "${LOCAL_SHA}" ]] && continue
     # deletion: the local side is all zeros, nothing is published.
     [[ "${LOCAL_SHA}" =~ ^0+$ ]] && continue
     if [[ "${REMOTE_SHA}" =~ ^0+$ ]]; then
@@ -196,7 +223,12 @@ for RANGE in "${RANGES[@]}"; do
     done
     [[ "${#ARGS[@]}" -eq 0 ]] && continue
 
-    COUNT="$(git rev-list --count "${ARGS[@]}" 2>/dev/null || printf '0')"
+    # a failed rev-list must not read as "0 commits, nothing to scan": that is
+    # the difference between an empty range and an unreadable one.
+    if ! COUNT="$(git rev-list --count "${ARGS[@]}" 2>/dev/null)"; then
+        guard_abort "git rev-list failed for range '${ARGS[0]}'"
+    fi
+    [[ "${COUNT}" =~ ^[0-9]+$ ]] || guard_abort "git rev-list returned a non-numeric count for '${ARGS[0]}'"
     [[ "${COUNT}" -eq 0 ]] && continue
     LIMIT=()
     if [[ "${COUNT}" -gt "${MAX_COMMITS}" ]]; then
@@ -207,9 +239,14 @@ for RANGE in "${RANGES[@]}"; do
     # one walk per range. -p over the range (rather than a squashed diff)
     # still catches a secret added in one commit and removed in a later
     # one: both remain in the published history.
-    ADDED="$(git log -p --no-color --no-merges --unified=0 "${LIMIT[@]}" "${ARGS[@]}" \
-        -- . "${SCAN_EXCLUDE_PATHS[@]}" 2>/dev/null \
-        | grep -E '^\+' | grep -vE '^\+\+\+' || true)"
+    # capture the walk on its own before filtering: piping straight into grep
+    # would hand the pipeline grep's status and hide a git failure, which then
+    # reads as an empty diff and passes the push.
+    if ! DIFF_RAW="$(git log -p --no-color --no-merges --unified=0 "${LIMIT[@]}" "${ARGS[@]}" \
+        -- . "${SCAN_EXCLUDE_PATHS[@]}" 2>/dev/null)"; then
+        guard_abort "git log -p failed for range '${ARGS[0]}'; the content scan did not run"
+    fi
+    ADDED="$(printf '%s\n' "${DIFF_RAW}" | grep -E '^\+' | grep -vE '^\+\+\+' || true)"
 
     if [[ -n "${ADDED}" ]]; then
         for PATTERN in "${SECRET_CONTENT_PATTERNS[@]}"; do
@@ -233,9 +270,12 @@ for RANGE in "${RANGES[@]}"; do
         done
     fi
 
-    # filenames, independent of content
-    PATHS="$(git log --name-only --pretty=format: --no-merges "${LIMIT[@]}" "${ARGS[@]}" 2>/dev/null \
-        | sort -u | grep -vE '^$' || true)"
+    # filenames, independent of content. same rule as the content walk: a git
+    # failure here must block, not present as "no paths in this push".
+    if ! PATHS_RAW="$(git log --name-only --pretty=format: --no-merges "${LIMIT[@]}" "${ARGS[@]}" 2>/dev/null)"; then
+        guard_abort "git log --name-only failed for range '${ARGS[0]}'; the filename scan did not run"
+    fi
+    PATHS="$(printf '%s\n' "${PATHS_RAW}" | sort -u | grep -vE '^$' || true)"
     if [[ -n "${PATHS}" ]]; then
         # name what the content scan did not read, so an exclusion never
         # reads as clean coverage
