@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # shellcheck shell=bash
-# pre-push hook v1.4 created 2605 cl-bs updated 2608 cl-bs
+# pre-push hook v1.5 created 2605 cl-bs updated 2608 cl-bs
 #
 # universal pre-push guard. two independent checks, both fail closed:
 #
@@ -8,6 +8,10 @@
 # command, an unresolvable remote URL, and an empty ref-update list each read
 # as "found nothing" and passed the push. every such path now aborts via
 # guard_abort. found by review on claude-bocuse#3.
+#
+# one documented exception, so "fail closed" is not read wider than it is:
+# MAX_COMMITS caps how many commits per ref are scanned, and beyond it the
+# push proceeds with a warning rather than a refusal. see the constant.
 #
 #   1. remote URL: reject a push to a remote whose URL embeds a credential
 #      or token shape. catches a URL added to .git/config in a prior
@@ -30,7 +34,14 @@ set -o errexit -o nounset -o pipefail -o errtrace
 IFS=$'\n\t'
 
 # newest commits scanned per ref update. a first push to an empty remote
-# would otherwise walk the entire history; the cap is reported, never silent.
+# would otherwise walk the entire history.
+#
+# this is the ONE place the guard is not fail-closed, so it is stated rather
+# than buried: beyond this many commits per ref the older ones are NOT
+# scanned, and the push proceeds with a warning naming how many were skipped.
+# blocking instead would stop every legitimate first push of a large repo.
+# (copilot review, claude-bocuse#4, which correctly called the header
+# inconsistent with this behaviour.)
 readonly MAX_COMMITS=1000
 
 # fail closed. every git invocation below feeds a security decision, so a
@@ -110,9 +121,16 @@ fi
 if [[ -n "${REMOTE_URL}" ]]; then
     for PATTERN in "${DANGEROUS_URL_PATTERNS[@]}"; do
         if printf '%s' "${REMOTE_URL}" | grep -qE -- "${PATTERN}"; then
+            # redact the userinfo before printing. this URL matched a
+            # credential pattern, so by construction it CONTAINS the secret;
+            # echoing it verbatim would copy the leak into the terminal
+            # scrollback, the CI log and any screen recording. host and path
+            # stay, which is all that is needed to identify the remote.
+            # (copilot review, claude-bocuse#4)
+            REDACTED_URL="$(printf '%s' "${REMOTE_URL}" | sed -E 's|://[^/@]+@|://[REDACTED]@|')"
             printf '[error] pre-push: remote URL embeds a credential or token shape\n' >&2
             printf '[error]   remote:  %s\n' "${REMOTE_NAME}" >&2
-            printf '[error]   url:     %s\n' "${REMOTE_URL}" >&2
+            printf '[error]   url:     %s\n' "${REDACTED_URL}" >&2
             printf '[error]   pattern: %s\n' "${PATTERN}" >&2
             printf '[error] use credential.helper (libsecret) or ssh; rotate any leaked\n' >&2
             printf '[error] token at the issuer immediately if it has been pushed.\n' >&2
