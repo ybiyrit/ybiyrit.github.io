@@ -5,7 +5,7 @@
 #
 # ---
 # name: test-pre-push
-# version: v1.3
+# version: v1.4
 # created: 2026-08-02
 # created_by: cl-bs
 # updated: 2026-09-23
@@ -175,7 +175,9 @@ main() {
     # a deletion publishes nothing and must not error
     _setup_repo
     git push -q origin main 2>/dev/null
-    rc="$(_rc git push -q origin :refs/heads/absent 2>"${ROOT}/o7")"
+    git push -q origin HEAD:refs/heads/doomed 2>/dev/null
+    rc="$(_rc git push -q origin :refs/heads/doomed 2>"${ROOT}/o7")"
+    _check "deletion of a real remote branch allowed" 0 "${rc}"
     _expect_output "deletion did not crash the hook" no "line .*: " "${ROOT}/o7"
 
     # documented escape hatch: git bypasses hooks entirely
@@ -241,6 +243,19 @@ main() {
     rc="$(_rc bash "${HOOK}" origin "https://github.com/owner/repo.git" \
         <<< "refs/heads/feature ${head_sha} refs/heads/feature ${zero}" 2>"${ROOT}/o16")"
     _check "feature branch push to github allowed" 0 "${rc}"
+
+    # v1.8: the host is parsed, so github.com in a PATH is not a PR forge,
+    # and GitHub's ssh-over-443 host and an https userinfo still are
+    git symbolic-ref --delete refs/remotes/origin/HEAD
+    rc="$(_rc bash "${HOOK}" origin "https://git.example/github.com/owner/repo.git" \
+        <<< "refs/heads/main ${head_sha} refs/heads/main ${zero}" 2>"${ROOT}/o17")"
+    _check "github.com as a path segment is not a PR forge" 0 "${rc}"
+    rc="$(_rc bash "${HOOK}" origin "ssh://git@ssh.github.com:443/owner/repo.git" \
+        <<< "refs/heads/main ${head_sha} refs/heads/main ${zero}" 2>"${ROOT}/o18")"
+    _check "ssh.github.com main push refused" 1 "${rc}"
+    rc="$(_rc bash "${HOOK}" origin "https://someone@github.com/owner/repo.git" \
+        <<< "refs/heads/main ${head_sha} refs/heads/main ${zero}" 2>"${ROOT}/o19")"
+    _check "https userinfo form main push refused" 1 "${rc}"
 
     # manual invocation without args is a no-op, not a check of origin.
     # only stderr is silenced: _rc reports the exit code on stdout, and

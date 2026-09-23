@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # shellcheck shell=bash
-# pre-push hook v1.7 created 2605 cl-bs updated 2609 cl-bs
+# pre-push hook v1.8 created 2605 cl-bs updated 2609 cl-bs
 #
 # universal pre-push guard. three independent checks, all fail closed:
 #
@@ -240,7 +240,10 @@ PII_PATTERNS=(
 DEFAULT_BRANCH_RE='^refs/heads/(main|master)$'
 # the remote's own default counts too, where the clone knows it: a repo on
 # trunk or develop was not protected by the fixed pair. (copilot review,
-# claude-bocuse#5)
+# claude-bocuse#5.) known limit: this reads the cached refs/remotes/<r>/HEAD;
+# a clone that never recorded it (git remote add without fetch) gets an
+# empty value, and the main/master pair still applies. querying the remote
+# here would add a network round trip to every push.
 REMOTE_DEFAULT="$(git symbolic-ref -q --short "refs/remotes/${REMOTE_NAME}/HEAD" 2>/dev/null || true)"
 REMOTE_DEFAULT="${REMOTE_DEFAULT#"${REMOTE_NAME}"/}"
 # only on a forge that has pull requests. ~/config, ~/bin and the other
@@ -248,11 +251,19 @@ REMOTE_DEFAULT="${REMOTE_DEFAULT#"${REMOTE_NAME}"/}"
 # where there is no PR to land through; refusing there would break the
 # ordinary workflow of 30-odd repos to enforce a rule that does not apply
 # to them.
-# the host part, case-folded: host names are case-insensitive, so the old
-# `*github.com*` substring let git@GITHUB.COM:o/r through and matched any
-# host that merely contained the string. (copilot review, claude#3)
+# the host, parsed and case-folded. the old `*github.com*` substring let
+# git@GITHUB.COM:o/r through (claude#3); v1.7's boundary regex still matched
+# github.com as a PATH segment, https://git.example/github.com/r (fleet
+# review of v1.7). so read the authority: scheme://[user@]host[:port]/...
+# or the scp form [user@]host:path. ssh.github.com is GitHub's ssh-over-443.
 REMOTE_URL_LC="${REMOTE_URL,,}"
-if [[ "${ALLOW_PUSH_TO_MAIN:-0}" != "1" && "${REMOTE_URL_LC}" =~ (^|[@/])github\.com([:/]|$) ]]; then
+REMOTE_HOST=""
+if [[ "${REMOTE_URL_LC}" =~ ^[a-z][a-z0-9+.-]*://([^/@]*@)?([^/:]+) ]]; then
+    REMOTE_HOST="${BASH_REMATCH[2]}"
+elif [[ "${REMOTE_URL_LC}" =~ ^([^@/:]+@)?([^/:]+): ]]; then
+    REMOTE_HOST="${BASH_REMATCH[2]}"
+fi
+if [[ "${ALLOW_PUSH_TO_MAIN:-0}" != "1" && ( "${REMOTE_HOST}" == "github.com" || "${REMOTE_HOST}" == "ssh.github.com" ) ]]; then
     while IFS=' ' read -r _L_REF L_SHA R_REF _R_SHA; do
         [[ -z "${L_SHA}" ]] && continue
         # a deletion is refused by branch protection anyway, and is not a
