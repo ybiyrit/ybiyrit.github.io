@@ -1,8 +1,17 @@
 #!/usr/bin/env bash
 # shellcheck shell=bash
-# pre-push hook v1.3 created 2605 cl-bs updated 2608 cl-bs
+# pre-push hook v1.6 created 2605 cl-bs updated 2609 cl-bs
 #
 # universal pre-push guard. two independent checks, both fail closed:
+#
+# "fail closed" is load-bearing and was not true before v1.4: an errored git
+# command, an unresolvable remote URL, and an empty ref-update list each read
+# as "found nothing" and passed the push. every such path now aborts via
+# guard_abort. found by review on claude-bocuse#3.
+#
+# one documented exception, so "fail closed" is not read wider than it is:
+# MAX_COMMITS caps how many commits per ref are scanned, and beyond it the
+# push proceeds with a warning rather than a refusal. see the constant.
 #
 #   1. remote URL: reject a push to a remote whose URL embeds a credential
 #      or token shape. catches a URL added to .git/config in a prior
@@ -14,10 +23,12 @@
 #      personal dotfiles repo legitimately carries the owner's name and
 #      home paths, so blocking on those would make the hook unusable.
 #
-# this file is the MASTER. `dotfiles.sh git-hooks --apply` mirrors it into
-# every discovered repo's .githooks/ and sets core.hooksPath, so extending
-# the catalogue here extends it everywhere. keep it self-contained: it runs
-# inside repos that cannot see ~/bin.
+# the MASTER is ~/config/.githooks/pre-push. `dotfiles.sh git-hooks --apply`
+# mirrors it into every discovered repo's .githooks/ and sets core.hooksPath,
+# so extending the catalogue there extends it everywhere. every copy carries
+# this same header, so naming the path matters: editing a mirror looks like
+# it works and the next --apply silently reverts it. keep it self-contained:
+# it runs inside repos that cannot see ~/bin.
 #
 # install: git config core.hooksPath .githooks   (per clone; dotfiles.sh does it)
 # bypass:  git push --no-verify   (git itself; nothing here can prevent that)
@@ -25,8 +36,27 @@ set -o errexit -o nounset -o pipefail -o errtrace
 IFS=$'\n\t'
 
 # newest commits scanned per ref update. a first push to an empty remote
-# would otherwise walk the entire history; the cap is reported, never silent.
+# would otherwise walk the entire history.
+#
+# this is the ONE place the guard is not fail-closed, so it is stated rather
+# than buried: beyond this many commits per ref the older ones are NOT
+# scanned, and the push proceeds with a warning naming how many were skipped.
+# blocking instead would stop every legitimate first push of a large repo.
+# (copilot review, claude-bocuse#4, which correctly called the header
+# inconsistent with this behaviour.)
 readonly MAX_COMMITS=1000
+
+# fail closed. every git invocation below feeds a security decision, so a
+# command that ERRORS must not be read as "found nothing": that inverts the
+# guard into a pass. `2>/dev/null || true` on a scan is the same defect as an
+# empty match set. called with a reason; never returns.
+guard_abort() {
+    printf '[error] pre-push: cannot verify this push, refusing it\n' >&2
+    printf '[error]   reason: %s\n' "${1}" >&2
+    printf '[info]  this is fail-closed by design. re-run once the repository\n' >&2
+    printf '[info]  state is readable, or bypass deliberately with --no-verify.\n' >&2
+    exit 1
+}
 
 # git always passes both args during a real push: $1 = remote name, $2 = remote
 # URL. when invoked manually with no args (e.g. `bash .githooks/pre-push`),
@@ -84,12 +114,25 @@ DANGEROUS_URL_PATTERNS=(
   'https?://[^[:space:]/@]*\$\{?[A-Za-z_][^[:space:]/@]*@'
 )
 
+# an unresolvable remote URL is not a pass: check 1 cannot run, and the whole
+# point of it is that the URL may be the leak. refuse rather than skip.
+if [[ -z "${REMOTE_URL}" ]]; then
+    guard_abort "remote '${REMOTE_NAME}' has no resolvable URL, so the URL check cannot run"
+fi
+
 if [[ -n "${REMOTE_URL}" ]]; then
     for PATTERN in "${DANGEROUS_URL_PATTERNS[@]}"; do
         if printf '%s' "${REMOTE_URL}" | grep -qE -- "${PATTERN}"; then
+            # redact the userinfo before printing. this URL matched a
+            # credential pattern, so by construction it CONTAINS the secret;
+            # echoing it verbatim would copy the leak into the terminal
+            # scrollback, the CI log and any screen recording. host and path
+            # stay, which is all that is needed to identify the remote.
+            # (copilot review, claude-bocuse#4)
+            REDACTED_URL="$(printf '%s' "${REMOTE_URL}" | sed -E 's|://[^/@]+@|://[REDACTED]@|')"
             printf '[error] pre-push: remote URL embeds a credential or token shape\n' >&2
             printf '[error]   remote:  %s\n' "${REMOTE_NAME}" >&2
-            printf '[error]   url:     %s\n' "${REMOTE_URL}" >&2
+            printf '[error]   url:     %s\n' "${REDACTED_URL}" >&2
             printf '[error]   pattern: %s\n' "${PATTERN}" >&2
             printf '[error] use credential.helper (libsecret) or ssh; rotate any leaked\n' >&2
             printf '[error] token at the issuer immediately if it has been pushed.\n' >&2
@@ -135,17 +178,32 @@ SECRET_CONTENT_PATTERNS=(
 # fixed the tip and the push stayed blocked, which is how ~/config reached 85
 # unpushed commits and ~/bin 80.
 #
-# the exclusion is narrow by design. it drops content matching for five
+# the exclusion is narrow by design. it drops content matching for six
 # known catalogue and fixture paths; the FILENAME scan below still covers
 # them, and every other path in the repo is scanned exactly as before. a real
-# credential pasted into one of these five files would be missed, which is
+# credential pasted into one of these six files would be missed, which is
 # the accepted cost of a catalogue that can describe itself.
+#
+# check-hook-guards.sh joined the list on 2026-09-06. it probes each guard
+# with a sample that must match, so it necessarily carries credential-shaped
+# fixtures (ghp_AAAA..., secret@github.com). without the entry it could never
+# be pushed, and a guard whose own test suite is unpushable gets deleted
+# rather than fixed.
+# secret-content-patterns.txt is the pattern catalogue itself: it documents the
+# credential shapes it matches, so it matches itself. On 2026-09-07 its own
+# comment "(scheme://user:pass@host)" blocked every push carrying the file, the
+# guard's first day in service. test-secret-scan.sh is its fixture file and is
+# required by design to carry a sample per pattern, the same reason
+# test-pre-push.sh is listed.
 SCAN_EXCLUDE_PATHS=(
     ':(exclude,glob)**/.githooks/pre-push'
     ':(exclude,glob)**/.githooks/test-pre-push.sh'
+    ':(exclude,glob)**/.githooks/secret-content-patterns.txt'
+    ':(exclude,glob)**/.githooks/test-secret-scan.sh'
     ':(exclude,glob)**/hooks/block-dangerous-commands.sh'
     ':(exclude,glob)**/hooks/test-block-dangerous-commands.sh'
     ':(exclude,glob)**/pack-harness.sh'
+    ':(exclude,glob)**/check-hook-guards.sh'
 )
 
 # secret-shaped FILENAMES and restricted stores. a file whose name says
@@ -159,6 +217,45 @@ PII_PATTERNS=(
     '\b(10|192\.168|172\.(1[6-9]|2[0-9]|3[01]))\.[0-9]{1,3}\.[0-9]{1,3}\b'
 )
 
+# check 3: refuse a direct push to the default branch.
+#
+# The repo conventions say updates land via PR and that "direct push is
+# blocked at GitHub level". That was not true: branch protection on both
+# ybiyrit/research-academic and ybiyrit/design-system carries
+# enforce_admins=false, so the owner pushing to main is waved through and
+# the API still answers "protected: true". A protection that exempts the
+# only person who uses the repo is decorative, and on 2026-09-08 a commit
+# reached design-system main that way without review.
+#
+# This is the local half of the fix, and it fires before the network round
+# trip. The server half is `enforce_admins`, which has to be set per repo.
+#
+# Override for the case the convention already allows, a first push to an
+# empty remote, or an emergency the operator has decided on:
+#   ALLOW_PUSH_TO_MAIN=1 git push ...
+DEFAULT_BRANCH_RE='^refs/heads/(main|master)$'
+# only on a forge that has pull requests. ~/config, ~/bin and the other
+# dotfiles repos push main straight to a private git remote on the NAS,
+# where there is no PR to land through; refusing there would break the
+# ordinary workflow of 30-odd repos to enforce a rule that does not apply
+# to them.
+if [[ "${ALLOW_PUSH_TO_MAIN:-0}" != "1" && "${REMOTE_URL}" == *github.com* ]]; then
+    while IFS=' ' read -r _L_REF L_SHA R_REF _R_SHA; do
+        [[ -z "${L_SHA}" ]] && continue
+        # a deletion is refused by branch protection anyway, and is not a
+        # publish of new commits; leave it to the server.
+        [[ "${L_SHA}" =~ ^0+$ ]] && continue
+        if [[ "${R_REF}" =~ ${DEFAULT_BRANCH_RE} ]]; then
+            printf '[fail] pre-push: refusing a direct push to %s\n' "${R_REF}" >&2
+            printf '[info] this repo lands changes through a pull request:\n' >&2
+            printf '[info]   git switch -c <branch> && git push -u %s <branch>\n' "${REMOTE_NAME}" >&2
+            printf '[info]   gh pr create --base %s\n' "${R_REF#refs/heads/}" >&2
+            printf '[info] override once, deliberately: ALLOW_PUSH_TO_MAIN=1 git push ...\n' >&2
+            exit 1
+        fi
+    done <<< "${REF_UPDATES}"
+fi
+
 # collect the rev ranges this push would publish.
 RANGES=()
 SKIPPED_NOTE=""
@@ -167,6 +264,10 @@ SKIPPED_NOTE=""
 # into the first variable and leave every sha empty (a silently empty
 # range that scans nothing and passes everything).
 while IFS=' ' read -r _LOCAL_REF LOCAL_SHA _REMOTE_REF REMOTE_SHA; do
+    # a here-string of the empty string still yields ONE iteration, so an empty
+    # REF_UPDATES would otherwise fabricate a range of "..", which rev-list
+    # rejects and which used to be swallowed as "nothing to scan".
+    [[ -z "${LOCAL_SHA}" ]] && continue
     # deletion: the local side is all zeros, nothing is published.
     [[ "${LOCAL_SHA}" =~ ^0+$ ]] && continue
     if [[ "${REMOTE_SHA}" =~ ^0+$ ]]; then
@@ -196,7 +297,12 @@ for RANGE in "${RANGES[@]}"; do
     done
     [[ "${#ARGS[@]}" -eq 0 ]] && continue
 
-    COUNT="$(git rev-list --count "${ARGS[@]}" 2>/dev/null || printf '0')"
+    # a failed rev-list must not read as "0 commits, nothing to scan": that is
+    # the difference between an empty range and an unreadable one.
+    if ! COUNT="$(git rev-list --count "${ARGS[@]}" 2>/dev/null)"; then
+        guard_abort "git rev-list failed for range '${ARGS[0]}'"
+    fi
+    [[ "${COUNT}" =~ ^[0-9]+$ ]] || guard_abort "git rev-list returned a non-numeric count for '${ARGS[0]}'"
     [[ "${COUNT}" -eq 0 ]] && continue
     LIMIT=()
     if [[ "${COUNT}" -gt "${MAX_COMMITS}" ]]; then
@@ -207,9 +313,14 @@ for RANGE in "${RANGES[@]}"; do
     # one walk per range. -p over the range (rather than a squashed diff)
     # still catches a secret added in one commit and removed in a later
     # one: both remain in the published history.
-    ADDED="$(git log -p --no-color --no-merges --unified=0 "${LIMIT[@]}" "${ARGS[@]}" \
-        -- . "${SCAN_EXCLUDE_PATHS[@]}" 2>/dev/null \
-        | grep -E '^\+' | grep -vE '^\+\+\+' || true)"
+    # capture the walk on its own before filtering: piping straight into grep
+    # would hand the pipeline grep's status and hide a git failure, which then
+    # reads as an empty diff and passes the push.
+    if ! DIFF_RAW="$(git log -p --no-color --no-merges --unified=0 "${LIMIT[@]}" "${ARGS[@]}" \
+        -- . "${SCAN_EXCLUDE_PATHS[@]}" 2>/dev/null)"; then
+        guard_abort "git log -p failed for range '${ARGS[0]}'; the content scan did not run"
+    fi
+    ADDED="$(printf '%s\n' "${DIFF_RAW}" | grep -E '^\+' | grep -vE '^\+\+\+' || true)"
 
     if [[ -n "${ADDED}" ]]; then
         for PATTERN in "${SECRET_CONTENT_PATTERNS[@]}"; do
@@ -233,14 +344,17 @@ for RANGE in "${RANGES[@]}"; do
         done
     fi
 
-    # filenames, independent of content
-    PATHS="$(git log --name-only --pretty=format: --no-merges "${LIMIT[@]}" "${ARGS[@]}" 2>/dev/null \
-        | sort -u | grep -vE '^$' || true)"
+    # filenames, independent of content. same rule as the content walk: a git
+    # failure here must block, not present as "no paths in this push".
+    if ! PATHS_RAW="$(git log --name-only --pretty=format: --no-merges "${LIMIT[@]}" "${ARGS[@]}" 2>/dev/null)"; then
+        guard_abort "git log --name-only failed for range '${ARGS[0]}'; the filename scan did not run"
+    fi
+    PATHS="$(printf '%s\n' "${PATHS_RAW}" | sort -u | grep -vE '^$' || true)"
     if [[ -n "${PATHS}" ]]; then
         # name what the content scan did not read, so an exclusion never
         # reads as clean coverage
         SKIPPED_CONTENT="$(printf '%s\n' "${PATHS}" \
-            | grep -E -- '(^|/)(\.githooks/pre-push|\.githooks/test-pre-push\.sh|pack-harness\.sh)$|/hooks/(test-)?block-dangerous-commands\.sh$' || true)"
+            | grep -E -- '(^|/)(\.githooks/pre-push|\.githooks/test-pre-push\.sh|\.githooks/secret-content-patterns\.txt|\.githooks/test-secret-scan\.sh|pack-harness\.sh|check-hook-guards\.sh)$|/hooks/(test-)?block-dangerous-commands\.sh$' || true)"
         if [[ -n "${SKIPPED_CONTENT}" ]]; then
             printf '[info] pre-push: catalogue source(s) in this push, content scan skipped for:\n' >&2
             printf '%s\n' "${SKIPPED_CONTENT}" | sed 's/^/[info]   /' >&2
