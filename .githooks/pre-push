@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # shellcheck shell=bash
-# pre-push hook v1.6 created 2605 cl-bs updated 2609 cl-bs
+# pre-push hook v1.7 created 2605 cl-bs updated 2609 cl-bs
 #
-# universal pre-push guard. two independent checks, both fail closed:
+# universal pre-push guard. three independent checks, all fail closed:
 #
 # "fail closed" is load-bearing and was not true before v1.4: an errored git
 # command, an unresolvable remote URL, and an empty ref-update list each read
@@ -122,7 +122,11 @@ fi
 
 if [[ -n "${REMOTE_URL}" ]]; then
     for PATTERN in "${DANGEROUS_URL_PATTERNS[@]}"; do
-        if printf '%s' "${REMOTE_URL}" | grep -qE -- "${PATTERN}"; then
+        # a here-string, not `printf | grep -q`: grep -q may exit on the first
+        # match while printf still writes, and under pipefail the SIGPIPE would
+        # read as "no match". (copilot review, languages#2.) not reproduced on
+        # fry1 at 100 KB; kept because a here-string has no writer to kill.
+        if grep -qE -- "${PATTERN}" <<< "${REMOTE_URL}"; then
             # redact the userinfo before printing. this URL matched a
             # credential pattern, so by construction it CONTAINS the secret;
             # echoing it verbatim would copy the leak into the terminal
@@ -178,10 +182,10 @@ SECRET_CONTENT_PATTERNS=(
 # fixed the tip and the push stayed blocked, which is how ~/config reached 85
 # unpushed commits and ~/bin 80.
 #
-# the exclusion is narrow by design. it drops content matching for six
+# the exclusion is narrow by design. it drops content matching for eight
 # known catalogue and fixture paths; the FILENAME scan below still covers
 # them, and every other path in the repo is scanned exactly as before. a real
-# credential pasted into one of these six files would be missed, which is
+# credential pasted into one of these eight files would be missed, which is
 # the accepted cost of a catalogue that can describe itself.
 #
 # check-hook-guards.sh joined the list on 2026-09-06. it probes each guard
@@ -234,18 +238,27 @@ PII_PATTERNS=(
 # empty remote, or an emergency the operator has decided on:
 #   ALLOW_PUSH_TO_MAIN=1 git push ...
 DEFAULT_BRANCH_RE='^refs/heads/(main|master)$'
+# the remote's own default counts too, where the clone knows it: a repo on
+# trunk or develop was not protected by the fixed pair. (copilot review,
+# claude-bocuse#5)
+REMOTE_DEFAULT="$(git symbolic-ref -q --short "refs/remotes/${REMOTE_NAME}/HEAD" 2>/dev/null || true)"
+REMOTE_DEFAULT="${REMOTE_DEFAULT#"${REMOTE_NAME}"/}"
 # only on a forge that has pull requests. ~/config, ~/bin and the other
 # dotfiles repos push main straight to a private git remote on the NAS,
 # where there is no PR to land through; refusing there would break the
 # ordinary workflow of 30-odd repos to enforce a rule that does not apply
 # to them.
-if [[ "${ALLOW_PUSH_TO_MAIN:-0}" != "1" && "${REMOTE_URL}" == *github.com* ]]; then
+# the host part, case-folded: host names are case-insensitive, so the old
+# `*github.com*` substring let git@GITHUB.COM:o/r through and matched any
+# host that merely contained the string. (copilot review, claude#3)
+REMOTE_URL_LC="${REMOTE_URL,,}"
+if [[ "${ALLOW_PUSH_TO_MAIN:-0}" != "1" && "${REMOTE_URL_LC}" =~ (^|[@/])github\.com([:/]|$) ]]; then
     while IFS=' ' read -r _L_REF L_SHA R_REF _R_SHA; do
         [[ -z "${L_SHA}" ]] && continue
         # a deletion is refused by branch protection anyway, and is not a
         # publish of new commits; leave it to the server.
         [[ "${L_SHA}" =~ ^0+$ ]] && continue
-        if [[ "${R_REF}" =~ ${DEFAULT_BRANCH_RE} ]]; then
+        if [[ "${R_REF}" =~ ${DEFAULT_BRANCH_RE} || ( -n "${REMOTE_DEFAULT}" && "${R_REF}" == "refs/heads/${REMOTE_DEFAULT}" ) ]]; then
             printf '[fail] pre-push: refusing a direct push to %s\n' "${R_REF}" >&2
             printf '[info] this repo lands changes through a pull request:\n' >&2
             printf '[info]   git switch -c <branch> && git push -u %s <branch>\n' "${REMOTE_NAME}" >&2
