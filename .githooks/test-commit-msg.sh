@@ -5,10 +5,10 @@
 #
 # ---
 # name: test-commit-msg
-# version: v1.0.0
+# version: v1.1.0
 # created: 2026-09-08
 # created_by: cl-bs
-# updated: 2026-09-08
+# updated: 2026-09-23
 # updated_by: cl-bs
 # description: fixture suite for the commit-msg hook; asserts one rejected sample per agent token and the controls that must still pass
 # type: test
@@ -53,10 +53,17 @@ assert_hook() {
     local msg_file="${WORK_DIR}/msg" rc=0
 
     printf '%s\n' "${message}" >"${msg_file}"
-    "${HOOK}" "${msg_file}" >/dev/null 2>&1 || rc=$?
+    "${HOOK}" "${msg_file}" >/dev/null 2>"${WORK_DIR}/err" || rc=$?
 
     if [[ "${expect}" == "reject" && "${rc}" -eq 0 ]]; then
         printf '[fail] %s: hook accepted a message it must reject\n' "${name}" >&2
+        FAILURES=$(( FAILURES + 1 ))
+        return 0
+    fi
+    # a reject must be the hook's own refusal, not a crash: rc 1 and the
+    # [fail] diagnostic. an unhandled error also exits non-zero.
+    if [[ "${expect}" == "reject" ]] && { [[ "${rc}" -ne 1 ]] || ! grep -q '^\[fail\] commit-msg' "${WORK_DIR}/err"; }; then
+        printf '[fail] %s: rejected without the hook diagnostic (rc=%s)\n' "${name}" "${rc}" >&2
         FAILURES=$(( FAILURES + 1 ))
         return 0
     fi
