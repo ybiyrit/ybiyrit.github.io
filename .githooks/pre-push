@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # shellcheck shell=bash
-# pre-push hook v1.8 created 2605 cl-bs updated 2609 cl-bs
+# pre-push hook v1.9 created 2605 cl-bs updated 2609 cl-bs
 #
 # universal pre-push guard. three independent checks, all fail closed:
 #
@@ -182,10 +182,10 @@ SECRET_CONTENT_PATTERNS=(
 # fixed the tip and the push stayed blocked, which is how ~/config reached 85
 # unpushed commits and ~/bin 80.
 #
-# the exclusion is narrow by design. it drops content matching for eight
+# the exclusion is narrow by design. it drops content matching for ten
 # known catalogue and fixture paths; the FILENAME scan below still covers
 # them, and every other path in the repo is scanned exactly as before. a real
-# credential pasted into one of these eight files would be missed, which is
+# credential pasted into one of these ten files would be missed, which is
 # the accepted cost of a catalogue that can describe itself.
 #
 # check-hook-guards.sh joined the list on 2026-09-06. it probes each guard
@@ -199,6 +199,11 @@ SECRET_CONTENT_PATTERNS=(
 # guard's first day in service. test-secret-scan.sh is its fixture file and is
 # required by design to carry a sample per pattern, the same reason
 # test-pre-push.sh is listed.
+# lib-redact.sh and feedback_token_url_guard.md joined on 2026-09-24. the first
+# is the redaction pattern catalogue and carries one fixture per pattern; the
+# second documents the token-URL guard's own regexes, so it matches itself. both
+# already marked those lines `pre-push: fixture`, the ~/bin convention, which this
+# hook does not read; without the entries every push of ~/config was refused.
 SCAN_EXCLUDE_PATHS=(
     ':(exclude,glob)**/.githooks/pre-push'
     ':(exclude,glob)**/.githooks/test-pre-push.sh'
@@ -208,6 +213,8 @@ SCAN_EXCLUDE_PATHS=(
     ':(exclude,glob)**/hooks/test-block-dangerous-commands.sh'
     ':(exclude,glob)**/pack-harness.sh'
     ':(exclude,glob)**/check-hook-guards.sh'
+    ':(exclude,glob)**/hooks/lib-redact.sh'
+    ':(exclude,glob)**/memory/feedback_token_url_guard.md'
 )
 
 # secret-shaped FILENAMES and restricted stores. a file whose name says
@@ -370,7 +377,12 @@ for RANGE in "${RANGES[@]}"; do
 
     # filenames, independent of content. same rule as the content walk: a git
     # failure here must block, not present as "no paths in this push".
-    if ! PATHS_RAW="$(git log --name-only --pretty=format: --no-merges "${LIMIT[@]}" "${ARGS[@]}" 2>/dev/null)"; then
+    # --diff-filter=d leaves out deletions: a commit that REMOVES a published
+    # secret-shaped path is the remediation, and without the filter it was
+    # refused, so a leaked file could not be taken back out. a path added and
+    # removed inside the range still shows through its adding commit.
+    # (~/bin test-pre-push.sh, "deleting a published path passes", 2026-09-25)
+    if ! PATHS_RAW="$(git log --name-only --diff-filter=d --pretty=format: --no-merges "${LIMIT[@]}" "${ARGS[@]}" 2>/dev/null)"; then
         guard_abort "git log --name-only failed for range '${ARGS[0]}'; the filename scan did not run"
     fi
     PATHS="$(printf '%s\n' "${PATHS_RAW}" | sort -u | grep -vE '^$' || true)"
@@ -378,7 +390,7 @@ for RANGE in "${RANGES[@]}"; do
         # name what the content scan did not read, so an exclusion never
         # reads as clean coverage
         SKIPPED_CONTENT="$(printf '%s\n' "${PATHS}" \
-            | grep -E -- '(^|/)(\.githooks/pre-push|\.githooks/test-pre-push\.sh|\.githooks/secret-content-patterns\.txt|\.githooks/test-secret-scan\.sh|pack-harness\.sh|check-hook-guards\.sh)$|/hooks/(test-)?block-dangerous-commands\.sh$' || true)"
+            | grep -E -- '(^|/)(\.githooks/pre-push|\.githooks/test-pre-push\.sh|\.githooks/secret-content-patterns\.txt|\.githooks/test-secret-scan\.sh|pack-harness\.sh|check-hook-guards\.sh|lib-redact\.sh|feedback_token_url_guard\.md)$|/hooks/(test-)?block-dangerous-commands\.sh$' || true)"
         if [[ -n "${SKIPPED_CONTENT}" ]]; then
             printf '[info] pre-push: catalogue source(s) in this push, content scan skipped for:\n' >&2
             printf '%s\n' "${SKIPPED_CONTENT}" | sed 's/^/[info]   /' >&2

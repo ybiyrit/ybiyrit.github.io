@@ -5,10 +5,10 @@
 #
 # ---
 # name: test-pre-push
-# version: v1.4
+# version: v1.5
 # created: 2026-08-02
 # created_by: cl-bs
-# updated: 2026-09-23
+# updated: 2026-09-25
 # updated_by: cl-bs
 # description: regression suite for .githooks/pre-push; builds throwaway repos in a tempdir and asserts what the hook blocks and what it lets through
 # type: test
@@ -256,6 +256,25 @@ main() {
     rc="$(_rc bash "${HOOK}" origin "https://someone@github.com/owner/repo.git" \
         <<< "refs/heads/main ${head_sha} refs/heads/main ${zero}" 2>"${ROOT}/o19")"
     _check "https userinfo form main push refused" 1 "${rc}"
+
+    # v1.9: removing a published secret-shaped path is the remediation and
+    # must pass; the scan used to list deleted paths and refused it
+    _setup_repo
+    mkdir -p etc/ssh
+    printf 'PermitRootLogin no\n' > etc/ssh/published.conf
+    git add etc/ssh/published.conf
+    git commit -qm "publish a secret-shaped path"
+    git push -q --no-verify origin main 2>/dev/null
+    git switch -q -c cleanup
+    git rm -q etc/ssh/published.conf
+    git commit -qm "delete the published path"
+    rc="$(_rc git push -q origin cleanup 2>"${ROOT}/o20")"
+    _check "deleting a published secret-shaped path passes" 0 "${rc}"
+    printf 'k\n' > id_rsa
+    git add id_rsa
+    git commit -qm "add a key name"
+    rc="$(_rc git push -q origin cleanup 2>"${ROOT}/o21")"
+    _check "adding a secret-shaped path still blocks" 1 "${rc}"
 
     # manual invocation without args is a no-op, not a check of origin.
     # only stderr is silenced: _rc reports the exit code on stdout, and
