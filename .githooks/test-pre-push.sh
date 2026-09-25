@@ -5,7 +5,7 @@
 #
 # ---
 # name: test-pre-push
-# version: v1.7
+# version: v1.8
 # created: 2026-08-02
 # created_by: cl-bs
 # updated: 2026-09-25
@@ -265,6 +265,9 @@ main() {
     rc="$(_rc bash "${HOOK}" origin "git@ssh.github.com.:owner/repo.git" \
         <<< "refs/heads/main ${head_sha} refs/heads/main ${zero}" 2>"${ROOT}/o19c")"
     _check "trailing-dot ssh.github.com. main push refused" 1 "${rc}"
+    rc="$(_rc bash "${HOOK}" origin "https://github.com../owner/repo.git" \
+        <<< "refs/heads/main ${head_sha} refs/heads/main ${zero}" 2>"${ROOT}/o19d")"
+    _check "two trailing dots main push refused" 1 "${rc}"
 
     # v1.9: removing a published secret-shaped path is the remediation and
     # must pass; the scan used to list deleted paths and refused it
@@ -297,6 +300,33 @@ main() {
     git commit -qm "rename the key to a harmless name"
     rc="$(_rc git push -q origin rename 2>"${ROOT}/o22")"
     _check "renaming a secret-shaped path to a harmless name blocks" 1 "${rc}"
+
+    # v1.11: git quotes a non-ASCII path; the quotes must not hide the name
+    _setup_repo
+    git switch -q -c quoted
+    mkdir -p "schlüssel"
+    printf 'k\n' > "schlüssel/id_rsa"
+    git add "schlüssel/id_rsa"
+    git commit -qm "add a key under a non-ascii directory"
+    rc="$(_rc git push -q origin quoted 2>"${ROOT}/o23")"
+    _check "a quoted non-ascii secret-shaped path blocks" 1 "${rc}"
+
+    # v1.11: a file added in the merge commit itself is scanned
+    _setup_repo
+    git switch -q -c side
+    printf 's\n' > side.md
+    git add side.md
+    git commit -qm "side"
+    git switch -q main
+    git switch -q -c evil
+    printf 'm\n' >> readme.md
+    git commit -qam "m2"
+    git merge -q --no-ff --no-commit side
+    printf 'k\n' > id_rsa
+    git add id_rsa
+    git commit -qm "merge with an added key"
+    rc="$(_rc git push -q origin evil 2>"${ROOT}/o24")"
+    _check "a secret-shaped path added in a merge commit blocks" 1 "${rc}"
 
     # manual invocation without args is a no-op, not a check of origin.
     # only stderr is silenced: _rc reports the exit code on stdout, and
