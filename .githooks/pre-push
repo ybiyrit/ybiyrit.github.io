@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # shellcheck shell=bash
-# pre-push hook v1.10 created 2605 cl-bs updated 2609 cl-bs
+# pre-push hook v1.11 created 2605 cl-bs updated 2609 cl-bs
 #
 # universal pre-push guard. three independent checks, all fail closed:
 #
@@ -271,8 +271,10 @@ elif [[ "${REMOTE_URL_LC}" =~ ^([^@/:]+@)?([^/:]+): ]]; then
     REMOTE_HOST="${BASH_REMATCH[2]}"
 fi
 # a fully qualified name with the root dot, github.com., resolves to the same
-# host and passed the comparison in v1.9 (design-system#90 review)
-REMOTE_HOST="${REMOTE_HOST%.}"
+# host and passed the comparison in v1.9 (design-system#90 review). known
+# limit: an ssh alias (git@gh:o/r with HostName github.com in ssh config)
+# names no host here; url.insteadOf and pushurl are resolved before the hook.
+while [[ "${REMOTE_HOST}" == *. ]]; do REMOTE_HOST="${REMOTE_HOST%.}"; done
 if [[ "${ALLOW_PUSH_TO_MAIN:-0}" != "1" && ( "${REMOTE_HOST}" == "github.com" || "${REMOTE_HOST}" == "ssh.github.com" ) ]]; then
     while IFS=' ' read -r _L_REF L_SHA R_REF _R_SHA; do
         [[ -z "${L_SHA}" ]] && continue
@@ -350,7 +352,10 @@ for RANGE in "${RANGES[@]}"; do
     # capture the walk on its own before filtering: piping straight into grep
     # would hand the pipeline grep's status and hide a git failure, which then
     # reads as an empty diff and passes the push.
-    if ! DIFF_RAW="$(git log -p --no-color --no-merges --unified=0 "${LIMIT[@]}" "${ARGS[@]}" \
+    # --diff-merges=first-parent: --no-merges skipped merge commits, so a file
+    # added in the merge commit itself was read by neither scan (v1.10 review,
+    # reproduced). a merged side branch is re-read against the first parent.
+    if ! DIFF_RAW="$(git log -p --no-color --diff-merges=first-parent --unified=0 "${LIMIT[@]}" "${ARGS[@]}" \
         -- . "${SCAN_EXCLUDE_PATHS[@]}" 2>/dev/null)"; then
         guard_abort "git log -p failed for range '${ARGS[0]}'; the content scan did not run"
     fi
@@ -383,10 +388,12 @@ for RANGE in "${RANGES[@]}"; do
     # name-status with rename detection: a genuine deletion (D) is skipped,
     # because removing a published secret-shaped path is the remediation and
     # was refused while deletions were listed (v1.9). a rename (R) or copy (C)
-    # counts under BOTH names, so moving id_rsa to backup.txt cannot slip the
-    # key out under a harmless name, which a plain deletion filter allowed
-    # (copilot review, claude-bocuse#6). every other status counts its path.
-    if ! PATHS_STATUS="$(git log --name-status -M --pretty=format: --no-merges "${LIMIT[@]}" "${ARGS[@]}" 2>/dev/null)"; then
+    # counts under BOTH names, so git mv id_rsa backup.txt is refused, which a
+    # plain deletion filter allowed (copilot review, claude-bocuse#6). every
+    # other status counts its path. residual of allowing D: a delete and a
+    # re-add in separate commits, or a rename with an edit past 50 percent,
+    # arrive as D plus A and pass; the content scan still reads the A side.
+    if ! PATHS_STATUS="$(git log --name-status -M --pretty=format: --diff-merges=first-parent "${LIMIT[@]}" "${ARGS[@]}" 2>/dev/null)"; then
         guard_abort "git log --name-status failed for range '${ARGS[0]}'; the filename scan did not run"
     fi
     PATHS_RAW="$(printf '%s\n' "${PATHS_STATUS}" | awk -F'\t' '
@@ -394,7 +401,10 @@ for RANGE in "${RANGES[@]}"; do
         $1 ~ /^D/ { next }
         $1 ~ /^[RC]/ { print $2; print $3; next }
         { print $2 }')"
-    PATHS="$(printf '%s\n' "${PATHS_RAW}" | sort -u | grep -vE '^$' || true)"
+    # git C-quotes a path with a non-ASCII byte, tab, quote or backslash, and
+    # the closing quote defeated every $-anchored pattern: schlüssel/id_rsa
+    # passed (v1.10 review, reproduced). strip the outer quotes.
+    PATHS="$(printf '%s\n' "${PATHS_RAW}" | sed 's/^"\(.*\)"$/\1/' | sort -u | grep -vE '^$' || true)"
     if [[ -n "${PATHS}" ]]; then
         # name what the content scan did not read, so an exclusion never
         # reads as clean coverage
