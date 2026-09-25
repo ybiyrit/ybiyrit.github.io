@@ -5,10 +5,10 @@
 #
 # ---
 # name: test-commit-msg
-# version: v1.1.0
+# version: v1.1.1
 # created: 2026-09-08
 # created_by: cl-bs
-# updated: 2026-09-23
+# updated: 2026-09-25
 # updated_by: cl-bs
 # description: fixture suite for the commit-msg hook; asserts one rejected sample per agent token and the controls that must still pass
 # type: test
@@ -35,6 +35,7 @@
 # fixture cannot pass unnoticed.
 
 set -o errexit -o nounset -o pipefail -o errtrace
+IFS=$'\n\t'
 
 SELF_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 readonly SELF_DIR

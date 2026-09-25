@@ -5,7 +5,7 @@
 #
 # ---
 # name: test-pre-push
-# version: v1.6
+# version: v1.7
 # created: 2026-08-02
 # created_by: cl-bs
 # updated: 2026-09-25
@@ -42,6 +42,7 @@
 # usage: .githooks/test-pre-push.sh   (exit 0 = all assertions passed)
 
 set -o errexit -o nounset -o pipefail -o errtrace
+IFS=$'\n\t'
 
 HOOK="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/pre-push"
 readonly HOOK
