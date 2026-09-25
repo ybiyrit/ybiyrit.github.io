@@ -5,7 +5,7 @@
 #
 # ---
 # name: test-pre-push
-# version: v1.5
+# version: v1.6
 # created: 2026-08-02
 # created_by: cl-bs
 # updated: 2026-09-25
@@ -246,7 +246,8 @@ main() {
 
     # v1.8: the host is parsed, so github.com in a PATH is not a PR forge,
     # and GitHub's ssh-over-443 host and an https userinfo still are
-    git symbolic-ref --delete refs/remotes/origin/HEAD
+    # -q: the ref may be absent, and errexit must not end the suite here
+    git symbolic-ref -q --delete refs/remotes/origin/HEAD || true
     rc="$(_rc bash "${HOOK}" origin "https://git.example/github.com/owner/repo.git" \
         <<< "refs/heads/main ${head_sha} refs/heads/main ${zero}" 2>"${ROOT}/o17")"
     _check "github.com as a path segment is not a PR forge" 0 "${rc}"
@@ -256,6 +257,13 @@ main() {
     rc="$(_rc bash "${HOOK}" origin "https://someone@github.com/owner/repo.git" \
         <<< "refs/heads/main ${head_sha} refs/heads/main ${zero}" 2>"${ROOT}/o19")"
     _check "https userinfo form main push refused" 1 "${rc}"
+    # v1.10: the root dot names the same host
+    rc="$(_rc bash "${HOOK}" origin "https://github.com./owner/repo.git" \
+        <<< "refs/heads/main ${head_sha} refs/heads/main ${zero}" 2>"${ROOT}/o19b")"
+    _check "trailing-dot github.com. main push refused" 1 "${rc}"
+    rc="$(_rc bash "${HOOK}" origin "git@ssh.github.com.:owner/repo.git" \
+        <<< "refs/heads/main ${head_sha} refs/heads/main ${zero}" 2>"${ROOT}/o19c")"
+    _check "trailing-dot ssh.github.com. main push refused" 1 "${rc}"
 
     # v1.9: removing a published secret-shaped path is the remediation and
     # must pass; the scan used to list deleted paths and refused it
@@ -275,6 +283,19 @@ main() {
     git commit -qm "add a key name"
     rc="$(_rc git push -q origin cleanup 2>"${ROOT}/o21")"
     _check "adding a secret-shaped path still blocks" 1 "${rc}"
+
+    # v1.10: a rename carries the secret-shaped source name, so moving a key
+    # to a harmless name in one commit still blocks (claude-bocuse#6 review)
+    _setup_repo
+    printf 'k\nk\nk\n' > id_rsa
+    git add id_rsa
+    git commit -qm "publish a key name"
+    git push -q --no-verify origin main 2>/dev/null
+    git switch -q -c rename
+    git mv id_rsa backup.txt
+    git commit -qm "rename the key to a harmless name"
+    rc="$(_rc git push -q origin rename 2>"${ROOT}/o22")"
+    _check "renaming a secret-shaped path to a harmless name blocks" 1 "${rc}"
 
     # manual invocation without args is a no-op, not a check of origin.
     # only stderr is silenced: _rc reports the exit code on stdout, and

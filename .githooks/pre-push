@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # shellcheck shell=bash
-# pre-push hook v1.9 created 2605 cl-bs updated 2609 cl-bs
+# pre-push hook v1.10 created 2605 cl-bs updated 2609 cl-bs
 #
 # universal pre-push guard. three independent checks, all fail closed:
 #
@@ -270,6 +270,9 @@ if [[ "${REMOTE_URL_LC}" =~ ^[a-z][a-z0-9+.-]*://([^/@]*@)?([^/:]+) ]]; then
 elif [[ "${REMOTE_URL_LC}" =~ ^([^@/:]+@)?([^/:]+): ]]; then
     REMOTE_HOST="${BASH_REMATCH[2]}"
 fi
+# a fully qualified name with the root dot, github.com., resolves to the same
+# host and passed the comparison in v1.9 (design-system#90 review)
+REMOTE_HOST="${REMOTE_HOST%.}"
 if [[ "${ALLOW_PUSH_TO_MAIN:-0}" != "1" && ( "${REMOTE_HOST}" == "github.com" || "${REMOTE_HOST}" == "ssh.github.com" ) ]]; then
     while IFS=' ' read -r _L_REF L_SHA R_REF _R_SHA; do
         [[ -z "${L_SHA}" ]] && continue
@@ -377,20 +380,26 @@ for RANGE in "${RANGES[@]}"; do
 
     # filenames, independent of content. same rule as the content walk: a git
     # failure here must block, not present as "no paths in this push".
-    # --diff-filter=d leaves out deletions: a commit that REMOVES a published
-    # secret-shaped path is the remediation, and without the filter it was
-    # refused, so a leaked file could not be taken back out. a path added and
-    # removed inside the range still shows through its adding commit.
-    # (~/bin test-pre-push.sh, "deleting a published path passes", 2026-09-25)
-    if ! PATHS_RAW="$(git log --name-only --diff-filter=d --pretty=format: --no-merges "${LIMIT[@]}" "${ARGS[@]}" 2>/dev/null)"; then
-        guard_abort "git log --name-only failed for range '${ARGS[0]}'; the filename scan did not run"
+    # name-status with rename detection: a genuine deletion (D) is skipped,
+    # because removing a published secret-shaped path is the remediation and
+    # was refused while deletions were listed (v1.9). a rename (R) or copy (C)
+    # counts under BOTH names, so moving id_rsa to backup.txt cannot slip the
+    # key out under a harmless name, which a plain deletion filter allowed
+    # (copilot review, claude-bocuse#6). every other status counts its path.
+    if ! PATHS_STATUS="$(git log --name-status -M --pretty=format: --no-merges "${LIMIT[@]}" "${ARGS[@]}" 2>/dev/null)"; then
+        guard_abort "git log --name-status failed for range '${ARGS[0]}'; the filename scan did not run"
     fi
+    PATHS_RAW="$(printf '%s\n' "${PATHS_STATUS}" | awk -F'\t' '
+        $1 == "" { next }
+        $1 ~ /^D/ { next }
+        $1 ~ /^[RC]/ { print $2; print $3; next }
+        { print $2 }')"
     PATHS="$(printf '%s\n' "${PATHS_RAW}" | sort -u | grep -vE '^$' || true)"
     if [[ -n "${PATHS}" ]]; then
         # name what the content scan did not read, so an exclusion never
         # reads as clean coverage
         SKIPPED_CONTENT="$(printf '%s\n' "${PATHS}" \
-            | grep -E -- '(^|/)(\.githooks/pre-push|\.githooks/test-pre-push\.sh|\.githooks/secret-content-patterns\.txt|\.githooks/test-secret-scan\.sh|pack-harness\.sh|check-hook-guards\.sh|lib-redact\.sh|feedback_token_url_guard\.md)$|/hooks/(test-)?block-dangerous-commands\.sh$' || true)"
+            | grep -E -- '(^|/)(\.githooks/pre-push|\.githooks/test-pre-push\.sh|\.githooks/secret-content-patterns\.txt|\.githooks/test-secret-scan\.sh|pack-harness\.sh|check-hook-guards\.sh|hooks/lib-redact\.sh|memory/feedback_token_url_guard\.md)$|/hooks/(test-)?block-dangerous-commands\.sh$' || true)"
         if [[ -n "${SKIPPED_CONTENT}" ]]; then
             printf '[info] pre-push: catalogue source(s) in this push, content scan skipped for:\n' >&2
             printf '%s\n' "${SKIPPED_CONTENT}" | sed 's/^/[info]   /' >&2
