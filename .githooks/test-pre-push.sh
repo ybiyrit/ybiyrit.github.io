@@ -5,12 +5,12 @@
 #
 # ---
 # name: test-pre-push
-# version: v1.8
+# version: v1.11
 # created: 2026-08-02
 # created_by: cl-bs
-# updated: 2026-09-25
+# updated: 2026-09-28
 # updated_by: cl-bs
-# description: regression suite for .githooks/pre-push; builds throwaway repos in a tempdir and asserts what the hook blocks and what it lets through
+# description: regression suite for .githooks/pre-push; builds throwaway repos in a tempdir and asserts what the hook blocks and what it lets through. v1.3 adds coverage for the fixture marker's markdown form and the new-ref path base, merged from the develop line into the v1.7 hook. v1.4 adds coverage for the eight v1.8 security fixes: basic-auth redaction (content scan and PII sweep), merge-commit scanning via first-parent diff, per-remote new-ref exclusion, the fixture marker's whole-line match, non-ASCII path scanning, the exact-path catalogue exclusion, content-aware already-published detection, and check-1 userinfo redaction with a slash. v1.5 adds coverage for the v1.9 already-published fix: a blob swapped to a real secret and back within one range still blocks, content recreated identical to the base blob still warns, a deletion-only range still warns, a new-ref blob matching a later-sorted remote branch still warns (not just the first-sorted one), and a new-ref blob matching no base still blocks. v1.6 adds coverage for the remaining v1.9 fixes that had none: a push target given as a bare URL redacts on every REMOTE_DISPLAY output line, not just the check-1 refusal; the PII sweep masks the full check-2 catalogue (not only URL userinfo) before re-reading ADDED content, so a token immediately followed by "@domain" is not printed twice; a remote name carrying a glob or pipe character is refused outright; redact_url() and the generic basic-auth URL pattern go greedy past a second userinfo "@" and accept an empty password; a fixture marker's trailing whitespace before the marker still exempts the line, in both comment and markdown form; and the fail-closed rev-list abort names `git fetch` when a --force push's remote sha is not yet in this clone. v1.9 merges the main line's suite (v1.7 to v1.8): check 3 on a PR forge with a parsed, case-folded host and trailing root dots, the long credential URL that outlasts the pipe buffer, a deletion that passes and an addition that still blocks, a rename to a harmless name that blocks, a quoted non-ASCII path and a file added in the merge commit itself. v1.10 adds the v2.0 lineage's case that main lacked: a fixture marker mid-line does not exempt the token after it.
 # type: test
 # ---
 #
@@ -44,7 +44,13 @@
 set -o errexit -o nounset -o pipefail -o errtrace
 IFS=$'\n\t'
 
-HOOK="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/pre-push"
+# Defaults to the sibling hook, which is the installed master, so a bare run
+# tests what actually executes. PRE_PUSH_HOOK points it at a candidate
+# instead, which is the only way to test a change BEFORE installing it.
+# Without the override, a candidate run silently re-tested the installed hook
+# and reported a pass for code it had never read. Measured 2026-09-28 while
+# grafting a hook the suite never saw.
+HOOK="${PRE_PUSH_HOOK:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/pre-push}"
 readonly HOOK
 ROOT="$(mktemp -d)"
 readonly ROOT
@@ -82,7 +88,12 @@ _expect_output() {
 # fresh bare remote + work tree with the hook installed
 _setup_repo() {
     rm -rf "${ROOT}/work" "${ROOT}/remote.git"
-    git init -q --bare "${ROOT}/remote.git"
+    # -b main on the BARE repo too. Without it the remote's HEAD follows the
+    # machine's init.defaultBranch, so on a host that still defaults to master
+    # a clone of this remote checks out nothing and the case that clones it
+    # fails with "src refspec main does not match any". Passed on a
+    # main-defaulting workstation, failed on a master-defaulting CI runner.
+    git init -q --bare -b main "${ROOT}/remote.git"
     git init -q -b main "${ROOT}/work"
     cd "${ROOT}/work"
     git config user.email "test@example.invalid"
@@ -90,6 +101,12 @@ _setup_repo() {
     git config commit.gpgsign false
     mkdir -p .githooks
     cp "${HOOK}" .githooks/pre-push
+    # cp preserves the source mode, and git silently IGNORES a hook that is
+    # not executable: it prints an advice line to stderr and runs the push
+    # unguarded, so the suite reports a pass for every case whose guard never
+    # executed. A candidate written by a redirect is mode 644. Measured
+    # 2026-09-28: 45 of 105 cases "passed" that way.
+    chmod +x .githooks/pre-push
     git config core.hooksPath .githooks
     git remote add origin "${ROOT}/remote.git"
     printf 'hello\n' > readme.md
@@ -153,6 +170,34 @@ main() {
     rc="$(_rc git push -q origin main 2>"${ROOT}/o9")"
     _check "same token outside the catalogue still blocked" 1 "${rc}"
 
+    # the fixture marker exempts a line by its TIP text, not just the commit
+    # that introduced it: a token added unmarked in one commit and marked
+    # afterwards is still scanned in its unmarked form by the range walk, so
+    # the exemption has to read the marker at the tip and reproduce the
+    # pre-marker line exactly. markdown marks with `<!-- pre-push: fixture -->`,
+    # not `#`, and a strip that only knows `#`/`;` leaves a dangling `<!--`
+    # that never matches the unmarked line.
+    _setup_repo
+    git push -q origin main 2>/dev/null
+    printf 'TOKEN=ghp_%s\n' "$(printf 'D%.0s' {1..36})" > NOTES.md
+    git add NOTES.md
+    git commit -qm "token in markdown, unmarked"
+    printf 'TOKEN=ghp_%s <!-- pre-push: fixture -->\n' "$(printf 'D%.0s' {1..36})" > NOTES.md
+    git add NOTES.md
+    git commit -qm "mark it as a fixture, markdown form"
+    rc="$(_rc git push -q origin main 2>"${ROOT}/o14")"
+    _check "fixture marked afterwards in markdown is honoured" 0 "${rc}"
+
+    # same shape, never marked: the marker machinery must not read as a
+    # global weakening of the content scan.
+    _setup_repo
+    git push -q origin main 2>/dev/null
+    printf 'TOKEN=ghp_%s\n' "$(printf 'E%.0s' {1..36})" > README.md
+    git add README.md
+    git commit -qm "token in markdown, unmarked, never fixed up"
+    rc="$(_rc git push -q origin main 2>"${ROOT}/o15")"
+    _check "unmarked markdown token still blocked" 1 "${rc}"
+
     # the NAME alone is disqualifying, whatever the content is
     _setup_repo
     git push -q origin main 2>/dev/null
@@ -181,6 +226,41 @@ main() {
     _check "deletion of a real remote branch allowed" 0 "${rc}"
     _expect_output "deletion did not crash the hook" no "line .*: " "${ROOT}/o7"
 
+    # a push that creates a new remote ref has no remote-side sha, so its
+    # base for "already published" must be every branch the remote has, not
+    # just none. with push.default=current a branch whose upstream has
+    # another name always pushes as a new ref, and a path every remote
+    # branch already carries must not read as newly published just because
+    # THIS ref is new. name-only also lists a path the range only DELETES.
+    _setup_repo
+    git push -q origin main 2>/dev/null
+    printf 'not actually a key\n' > server.pem
+    git add server.pem
+    git commit -qm "add pem on main"
+    # bypass to seed the fixture: the hook correctly blocks server.pem's own
+    # arrival on main (see "secret-shaped filename blocked" above), so the
+    # documented escape hatch is the only way to get it onto the remote for
+    # this scenario to publish it FROM.
+    git push -q --no-verify origin main 2>/dev/null
+    git checkout -qb feature
+    git rm -q server.pem
+    git commit -qm "remove pem on feature"
+    rc="$(_rc git push -q origin feature 2>"${ROOT}/o12")"
+    _check "new ref deleting a path every remote branch has is allowed" 0 "${rc}"
+    _expect_output "already-published path warned, not blocked" yes "remote already has" "${ROOT}/o12"
+
+    # a path no remote branch has yet must still block on a new ref: falling
+    # back to "every branch" must not become "any branch passes it".
+    _setup_repo
+    git push -q origin main 2>/dev/null
+    git checkout -qb feature2
+    printf 'not actually a key\n' > only-here.pem
+    git add only-here.pem
+    git commit -qm "add pem only on the new branch"
+    rc="$(_rc git push -q origin feature2 2>"${ROOT}/o13")"
+    _check "new ref with a path no remote branch has is still blocked" 1 "${rc}"
+    _expect_output "newly published path reported" yes "newly published" "${ROOT}/o13"
+
     # documented escape hatch: git bypasses hooks entirely
     _setup_repo
     git push -q origin main 2>/dev/null
@@ -200,6 +280,12 @@ main() {
     _expect_output "userinfo redacted" yes "REDACTED" "${ROOT}/o11"
     _expect_output "host still identifiable" yes "example.invalid" "${ROOT}/o11"
 
+    # a blocked URL may carry a second secret in its query string.
+    rc="$(_rc bash "${HOOK}" leaky "https://someone:hunter2@example.invalid/r.git?access_token=qtok7" < /dev/null 2>"${ROOT}/o11q")"
+    _check "credential URL with a query token blocks the push" 1 "${rc}"
+    _expect_output "query token not echoed" no "qtok7" "${ROOT}/o11q"
+    _expect_output "path kept beside the masked query" yes "example.invalid/r.git" "${ROOT}/o11q"
+
     # v1.4 fail-closed paths. a guard that can only be reached by breaking the
     # repository is the one most likely to be wrong, so exercise the reachable
     # end of it: an unresolvable remote means check 1 cannot run, and "cannot
@@ -218,7 +304,7 @@ main() {
     _setup_repo
     local long_path
     long_path="$(printf 'p%.0s' {1..100000})"
-    rc="$(_rc bash "${HOOK}" leaky "https://someone:hunter2@example.invalid/${long_path}" < /dev/null 2>"${ROOT}/o12")"
+    rc="$(_rc bash "${HOOK}" leaky "https://someone:hunter2@example.invalid/${long_path}" < /dev/null 2>"${ROOT}/m1")"
     _check "long credential URL still blocks (no SIGPIPE pass)" 1 "${rc}"
 
     # v1.7 check 3 on a PR forge. the hook reads ref updates on stdin, so feed
@@ -228,21 +314,21 @@ main() {
     head_sha="$(git rev-parse HEAD)"
     zero="0000000000000000000000000000000000000000"
     rc="$(_rc bash "${HOOK}" origin "git@GITHUB.COM:owner/repo.git" \
-        <<< "refs/heads/main ${head_sha} refs/heads/main ${zero}" 2>"${ROOT}/o13")"
+        <<< "refs/heads/main ${head_sha} refs/heads/main ${zero}" 2>"${ROOT}/m2")"
     _check "upper-case GITHUB.COM main push refused" 1 "${rc}"
-    _expect_output "refusal names the direct push" yes "refusing a direct push" "${ROOT}/o13"
+    _expect_output "refusal names the direct push" yes "refusing a direct push" "${ROOT}/m2"
 
     git symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/trunk
     rc="$(_rc bash "${HOOK}" origin "https://github.com/owner/repo.git" \
-        <<< "refs/heads/trunk ${head_sha} refs/heads/trunk ${zero}" 2>"${ROOT}/o14")"
+        <<< "refs/heads/trunk ${head_sha} refs/heads/trunk ${zero}" 2>"${ROOT}/m3")"
     _check "remote default branch trunk refused" 1 "${rc}"
 
     rc="$(_rc bash "${HOOK}" origin "https://notgithub.com.example/owner/repo.git" \
-        <<< "refs/heads/main ${head_sha} refs/heads/main ${zero}" 2>"${ROOT}/o15")"
+        <<< "refs/heads/main ${head_sha} refs/heads/main ${zero}" 2>"${ROOT}/m4")"
     _check "a host that only contains github.com is not a PR forge" 0 "${rc}"
 
     rc="$(_rc bash "${HOOK}" origin "https://github.com/owner/repo.git" \
-        <<< "refs/heads/feature ${head_sha} refs/heads/feature ${zero}" 2>"${ROOT}/o16")"
+        <<< "refs/heads/feature ${head_sha} refs/heads/feature ${zero}" 2>"${ROOT}/m5")"
     _check "feature branch push to github allowed" 0 "${rc}"
 
     # v1.8: the host is parsed, so github.com in a PATH is not a PR forge,
@@ -250,23 +336,23 @@ main() {
     # -q: the ref may be absent, and errexit must not end the suite here
     git symbolic-ref -q --delete refs/remotes/origin/HEAD || true
     rc="$(_rc bash "${HOOK}" origin "https://git.example/github.com/owner/repo.git" \
-        <<< "refs/heads/main ${head_sha} refs/heads/main ${zero}" 2>"${ROOT}/o17")"
+        <<< "refs/heads/main ${head_sha} refs/heads/main ${zero}" 2>"${ROOT}/m6")"
     _check "github.com as a path segment is not a PR forge" 0 "${rc}"
     rc="$(_rc bash "${HOOK}" origin "ssh://git@ssh.github.com:443/owner/repo.git" \
-        <<< "refs/heads/main ${head_sha} refs/heads/main ${zero}" 2>"${ROOT}/o18")"
+        <<< "refs/heads/main ${head_sha} refs/heads/main ${zero}" 2>"${ROOT}/m7")"
     _check "ssh.github.com main push refused" 1 "${rc}"
     rc="$(_rc bash "${HOOK}" origin "https://someone@github.com/owner/repo.git" \
-        <<< "refs/heads/main ${head_sha} refs/heads/main ${zero}" 2>"${ROOT}/o19")"
+        <<< "refs/heads/main ${head_sha} refs/heads/main ${zero}" 2>"${ROOT}/m8")"
     _check "https userinfo form main push refused" 1 "${rc}"
     # v1.10: the root dot names the same host
     rc="$(_rc bash "${HOOK}" origin "https://github.com./owner/repo.git" \
-        <<< "refs/heads/main ${head_sha} refs/heads/main ${zero}" 2>"${ROOT}/o19b")"
+        <<< "refs/heads/main ${head_sha} refs/heads/main ${zero}" 2>"${ROOT}/m9")"
     _check "trailing-dot github.com. main push refused" 1 "${rc}"
     rc="$(_rc bash "${HOOK}" origin "git@ssh.github.com.:owner/repo.git" \
-        <<< "refs/heads/main ${head_sha} refs/heads/main ${zero}" 2>"${ROOT}/o19c")"
+        <<< "refs/heads/main ${head_sha} refs/heads/main ${zero}" 2>"${ROOT}/m10")"
     _check "trailing-dot ssh.github.com. main push refused" 1 "${rc}"
     rc="$(_rc bash "${HOOK}" origin "https://github.com../owner/repo.git" \
-        <<< "refs/heads/main ${head_sha} refs/heads/main ${zero}" 2>"${ROOT}/o19d")"
+        <<< "refs/heads/main ${head_sha} refs/heads/main ${zero}" 2>"${ROOT}/m11")"
     _check "two trailing dots main push refused" 1 "${rc}"
 
     # v1.9: removing a published secret-shaped path is the remediation and
@@ -280,12 +366,12 @@ main() {
     git switch -q -c cleanup
     git rm -q etc/ssh/published.conf
     git commit -qm "delete the published path"
-    rc="$(_rc git push -q origin cleanup 2>"${ROOT}/o20")"
+    rc="$(_rc git push -q origin cleanup 2>"${ROOT}/m12")"
     _check "deleting a published secret-shaped path passes" 0 "${rc}"
     printf 'k\n' > id_rsa
     git add id_rsa
     git commit -qm "add a key name"
-    rc="$(_rc git push -q origin cleanup 2>"${ROOT}/o21")"
+    rc="$(_rc git push -q origin cleanup 2>"${ROOT}/m13")"
     _check "adding a secret-shaped path still blocks" 1 "${rc}"
 
     # v1.10: a rename carries the secret-shaped source name, so moving a key
@@ -298,8 +384,9 @@ main() {
     git switch -q -c rename
     git mv id_rsa backup.txt
     git commit -qm "rename the key to a harmless name"
-    rc="$(_rc git push -q origin rename 2>"${ROOT}/o22")"
+    rc="$(_rc git push -q origin rename 2>"${ROOT}/m14")"
     _check "renaming a secret-shaped path to a harmless name blocks" 1 "${rc}"
+    _expect_output "rename reported under both names" yes "id_rsa renamed to backup.txt" "${ROOT}/m14"
 
     # v1.11: git quotes a non-ASCII path; the quotes must not hide the name
     _setup_repo
@@ -308,7 +395,7 @@ main() {
     printf 'k\n' > "schlüssel/id_rsa"
     git add "schlüssel/id_rsa"
     git commit -qm "add a key under a non-ascii directory"
-    rc="$(_rc git push -q origin quoted 2>"${ROOT}/o23")"
+    rc="$(_rc git push -q origin quoted 2>"${ROOT}/m15")"
     _check "a quoted non-ascii secret-shaped path blocks" 1 "${rc}"
 
     # v1.11: a file added in the merge commit itself is scanned
@@ -325,7 +412,7 @@ main() {
     printf 'k\n' > id_rsa
     git add id_rsa
     git commit -qm "merge with an added key"
-    rc="$(_rc git push -q origin evil 2>"${ROOT}/o24")"
+    rc="$(_rc git push -q origin evil 2>"${ROOT}/m16")"
     _check "a secret-shaped path added in a merge commit blocks" 1 "${rc}"
 
     # manual invocation without args is a no-op, not a check of origin.
@@ -334,6 +421,511 @@ main() {
     # to stderr, so stdout stays clean for the code).
     rc="$(_rc bash "${HOOK}" 2>/dev/null)"
     _check "manual no-arg invocation is a no-op" 0 "${rc}"
+
+    # v1.8 fix 1 (check 2): a basic-auth credential in pushed CONTENT used to
+    # leak twice: the content-scan redaction sliced the MATCH into a 4+4
+    # prefix/suffix, which for a short match leaks the password's tail
+    # ("er2@"); and the advisory PII sweep re-read the unmasked ADDED lines,
+    # so the email-shaped part of "user:hunter2@host" printed the password in
+    # full a second time. two files, two shapes of the same defect.
+    _setup_repo
+    git push -q origin main 2>/dev/null
+    printf 'endpoint: ftp://user:hunter2@example.com\n' > ftp-leak.txt
+    printf 'contact bob:pw@example.com for access\n' > basic-auth.txt
+    git add ftp-leak.txt basic-auth.txt
+    git commit -qm "basic-auth credentials in content"
+    rc="$(_rc git push -q origin main 2>"${ROOT}/o20")"
+    _check "basic-auth content blocked" 1 "${rc}"
+    _expect_output "password not echoed by the content-scan redaction" no "hunter2" "${ROOT}/o20"
+    _expect_output "content-scan redaction does not leak a trailing slice" no "er2@" "${ROOT}/o20"
+    _expect_output "second credential fragment not echoed" no ":pw@" "${ROOT}/o20"
+    _expect_output "match shown as a whole redaction, not a slice" yes "REDACTED" "${ROOT}/o20"
+
+    # v1.8 fix 2 (check 2): --no-merges dropped merge commits from BOTH git
+    # log walks, so content added only while resolving a merge (a conflict
+    # resolution, or `merge --no-commit --no-ff` then `git add`) was never
+    # diffed and never scanned. --diff-merges=first-parent still shows what
+    # the merge changed relative to the branch it landed on.
+    _setup_repo
+    git push -q origin main 2>/dev/null
+    git checkout -qb side
+    printf 'side content\n' > side.txt
+    git add side.txt
+    git commit -qm "side commit"
+    git checkout -q main
+    git merge -q --no-commit --no-ff side
+    printf 'TOKEN=ghp_%s\n' "$(printf 'F%.0s' {1..36})" > leak.txt
+    printf 'not actually a key\n' > leak.pem
+    git add leak.txt leak.pem
+    git commit -qm "merge side, resolve with a leak"
+    rc="$(_rc git push -q origin main 2>"${ROOT}/o21")"
+    _check "content added while resolving a merge is scanned" 1 "${rc}"
+    _expect_output "merge-added token reported" yes "secret-shaped content added" "${ROOT}/o21"
+    _expect_output "merge-added filename reported" yes "secret-shaped path" "${ROOT}/o21"
+
+    # a clean merge (nothing added during the merge itself) must stay allowed;
+    # first-parent diffing a merge is not the same as blocking every merge.
+    _setup_repo
+    git push -q origin main 2>/dev/null
+    git checkout -qb side2
+    printf 'side2 content\n' > side2.txt
+    git add side2.txt
+    git commit -qm "side2 commit"
+    git checkout -q main
+    git merge -q --no-ff side2 -m "merge side2 cleanly"
+    rc="$(_rc git push -q origin main 2>"${ROOT}/o22")"
+    _check "clean merge still allowed" 0 "${rc}"
+
+    # v1.8 fix 3: a new-ref push used to exclude commits reachable from ANY
+    # configured remote's tracking refs (`--not --remotes`), not just the
+    # remote being pushed to. a token already fetched from origin then read
+    # as "covered" on the first push of the same commit to a second remote
+    # that had never seen it. seed the token via a hook-less clone (plain
+    # `git clone` carries no core.hooksPath), fetch it into the guarded work
+    # tree, then push the same history to a brand-new second remote.
+    _setup_repo
+    git push -q origin main 2>/dev/null
+    rm -rf "${ROOT}/hookless"
+    git clone -q "${ROOT}/remote.git" "${ROOT}/hookless"
+    (
+        cd "${ROOT}/hookless"
+        git config user.email "test@example.invalid"
+        git config user.name "test"
+        git config commit.gpgsign false
+        printf 'TOKEN=ghp_%s\n' "$(printf 'G%.0s' {1..36})" > seeded-token.txt
+        git add seeded-token.txt
+        git commit -qm "seed token, no hook here"
+        git push -q origin main
+    )
+    git fetch -q origin
+    git merge -q --ff-only origin/main
+    git init -q --bare "${ROOT}/pub.git"
+    git remote add pub "${ROOT}/pub.git"
+    rc="$(_rc git push -q pub main 2>"${ROOT}/o23")"
+    _check "a token already on origin still blocks a first push to a second remote" 1 "${rc}"
+    _expect_output "content flagged for the second remote" yes "secret-shaped content added" "${ROOT}/o23"
+
+    # pushing a clean new branch to the same second remote must still work;
+    # the fix scopes the exclusion, it does not remove it.
+    git checkout -qb clean-branch main~1
+    rc="$(_rc git push -q pub clean-branch 2>"${ROOT}/o24")"
+    _check "clean new branch to the second remote still allowed" 0 "${rc}"
+
+    # v1.8 fix 4: the fixture marker's exemption used to be a substring test
+    # (`grep -vFf`, no -x), so a marked placeholder whose stripped text was a
+    # PREFIX of an unrelated real secret line waved the real secret through
+    # too. real.txt reuses the same "export GITHUB_TOKEN=ghp_" prefix as the
+    # marked line in tmpl.md, with a real 36-char token appended.
+    _setup_repo
+    git push -q origin main 2>/dev/null
+    printf 'export GITHUB_TOKEN=ghp_ <!-- pre-push: fixture -->\n' > tmpl.md
+    printf 'export GITHUB_TOKEN=ghp_%s\n' "$(printf 'J%.0s' {1..36})" > real.txt
+    git add tmpl.md real.txt
+    git commit -qm "template plus a real leak sharing its prefix"
+    rc="$(_rc git push -q origin main 2>"${ROOT}/o25")"
+    _check "fixture prefix does not exempt an unrelated real secret" 1 "${rc}"
+
+    # the marked template on its own, with no unrelated line to smuggle past
+    # it, is still exempt.
+    _setup_repo
+    git push -q origin main 2>/dev/null
+    printf 'export GITHUB_TOKEN=ghp_ <!-- pre-push: fixture -->\n' > tmpl.md
+    git add tmpl.md
+    git commit -qm "template alone"
+    rc="$(_rc git push -q origin main 2>"${ROOT}/o26")"
+    _check "marked template alone allowed" 0 "${rc}"
+
+    # v1.8 fix 5: a non-ASCII path was octal-quoted ("\303\244-key.pem") by
+    # git's default core.quotePath, which put a closing quote right after the
+    # extension and defeated every `\.ext$` branch of SECRET_PATH_PATTERN.
+    _setup_repo
+    git push -q origin main 2>/dev/null
+    printf 'not actually a key\n' > 'ä-key.pem'
+    git add 'ä-key.pem'
+    git commit -qm "non-ASCII secret filename"
+    rc="$(_rc git push -q origin main 2>"${ROOT}/o27")"
+    _check "non-ASCII secret filename blocked" 1 "${rc}"
+    _expect_output "non-ASCII path reported" yes "secret-shaped path" "${ROOT}/o27"
+
+    _setup_repo
+    git push -q origin main 2>/dev/null
+    printf 'just some notes\n' > 'ä-notes.txt'
+    git add 'ä-notes.txt'
+    git commit -qm "non-ASCII harmless filename"
+    rc="$(_rc git push -q origin main 2>"${ROOT}/o28")"
+    _check "non-ASCII harmless filename allowed" 0 "${rc}"
+
+    # v1.8 fix 6: a `**/<basename>` glob in SCAN_EXCLUDE_PATHS matched that
+    # basename at ANY depth, so an attacker-planted `anywhere/<basename>`
+    # was excluded from the content scan too. the exclusion is now exact
+    # repo-relative paths.
+    _setup_repo
+    git push -q origin main 2>/dev/null
+    mkdir -p anywhere
+    printf 'TOKEN=ghp_%s\n' "$(printf 'K%.0s' {1..36})" > anywhere/check-hook-guards.sh
+    git add anywhere/check-hook-guards.sh
+    git commit -qm "planted basename at another depth"
+    rc="$(_rc git push -q origin main 2>"${ROOT}/o29")"
+    _check "a catalogue basename planted at another depth is not exempt" 1 "${rc}"
+    _expect_output "planted-path content flagged" yes "secret-shaped content added" "${ROOT}/o29"
+
+    # the real excluded path (repo root, matching SCAN_EXCLUDE_PATHS exactly)
+    # must still skip the content scan, or the fix is a global tightening
+    # wearing a narrow disguise.
+    _setup_repo
+    git push -q origin main 2>/dev/null
+    printf 'TOKEN=ghp_%s\n' "$(printf 'K%.0s' {1..36})" > check-hook-guards.sh
+    git add check-hook-guards.sh
+    git commit -qm "real excluded path"
+    rc="$(_rc git push -q origin main 2>"${ROOT}/o30")"
+    _check "the real excluded path still skips the content scan" 0 "${rc}"
+    _expect_output "skipped content scan reported" yes "content scan skipped" "${ROOT}/o30"
+
+    # v1.8 fix 7: "already published" used to mean the PATH existed at the
+    # base, not that its CONTENT did, so a placeholder secret-shaped file
+    # could be swapped for the real thing and only warn. seed a placeholder
+    # via a hook-less clone, then exercise a changed blob at the tip.
+    _setup_repo
+    git push -q origin main 2>/dev/null
+    rm -rf "${ROOT}/hookless"
+    git clone -q "${ROOT}/remote.git" "${ROOT}/hookless"
+    (
+        cd "${ROOT}/hookless"
+        git config user.email "test@example.invalid"
+        git config user.name "test"
+        git config commit.gpgsign false
+        printf 'placeholder\n' > api.token
+        git add api.token
+        git commit -qm "seed placeholder secret path, no hook here"
+        git push -q origin main
+    )
+    git fetch -q origin
+    git merge -q --ff-only origin/main
+    printf 'REALSECRETVALUE\n' > api.token
+    git add api.token
+    git commit -qm "swap the placeholder for a real secret"
+    rc="$(_rc git push -q origin main 2>"${ROOT}/o31")"
+    _check "changed content at an already-published secret path blocks" 1 "${rc}"
+    _expect_output "changed content reported as newly published" yes "newly published" "${ROOT}/o31"
+
+    # v1.9 fix: the check above compared only the TIP blob to the base, so a
+    # placeholder swapped for a real secret and swapped BACK within the same
+    # range compared equal at the tip and only warned, even though the real
+    # blob sits in an intermediate commit of the pushed history. every
+    # commit in the range that touches the path is now resolved, not just
+    # the tip.
+    _setup_repo
+    git push -q origin main 2>/dev/null
+    rm -rf "${ROOT}/hookless"
+    git clone -q "${ROOT}/remote.git" "${ROOT}/hookless"
+    (
+        cd "${ROOT}/hookless"
+        git config user.email "test@example.invalid"
+        git config user.name "test"
+        git config commit.gpgsign false
+        printf 'placeholder\n' > api.token
+        git add api.token
+        git commit -qm "seed placeholder secret path, no hook here"
+        git push -q origin main
+    )
+    git fetch -q origin
+    git merge -q --ff-only origin/main
+    printf 'REALSECRETVALUE\n' > api.token
+    git commit -qam "swap the placeholder for a real secret"
+    printf 'placeholder\n' > api.token
+    git commit -qam "swap it back before the tip"
+    rc="$(_rc git push -q origin main 2>"${ROOT}/o32")"
+    _check "a blob swapped to a real secret and back within the range still blocks" 1 "${rc}"
+    _expect_output "intermediate blob reported as newly published" yes "newly published" "${ROOT}/o32"
+
+    # content that genuinely never leaves the base's blob is still allowed:
+    # delete the path, then recreate it with byte-identical content. git
+    # gives the recreated blob the SAME object sha as the original (content
+    # addressing), so this is the "every range blob is already in the base
+    # set" branch, not the "path is only deleted" one: the path IS touched
+    # by a non-deleting commit here, and that commit's blob is still known.
+    _setup_repo
+    git push -q origin main 2>/dev/null
+    rm -rf "${ROOT}/hookless"
+    git clone -q "${ROOT}/remote.git" "${ROOT}/hookless"
+    (
+        cd "${ROOT}/hookless"
+        git config user.email "test@example.invalid"
+        git config user.name "test"
+        git config commit.gpgsign false
+        printf 'placeholder\n' > api.token
+        git add api.token
+        git commit -qm "seed placeholder secret path, no hook here"
+        git push -q origin main
+    )
+    git fetch -q origin
+    git merge -q --ff-only origin/main
+    git rm -q api.token
+    git commit -qm "delete api.token"
+    printf 'placeholder\n' > api.token
+    git add api.token
+    git commit -qm "recreate api.token with the identical published content"
+    rc="$(_rc git push -q origin main 2>"${ROOT}/o33")"
+    _check "content recreated identical to the base blob is allowed" 0 "${rc}"
+    _expect_output "already-has warning shown for unchanged content" yes "remote already has" "${ROOT}/o33"
+
+    # a path only deleted in the range publishes nothing new, whatever base
+    # it started from.
+    _setup_repo
+    git push -q origin main 2>/dev/null
+    rm -rf "${ROOT}/hookless"
+    git clone -q "${ROOT}/remote.git" "${ROOT}/hookless"
+    (
+        cd "${ROOT}/hookless"
+        git config user.email "test@example.invalid"
+        git config user.name "test"
+        git config commit.gpgsign false
+        printf 'placeholder\n' > api.token
+        git add api.token
+        git commit -qm "seed placeholder secret path, no hook here"
+        git push -q origin main
+    )
+    git fetch -q origin
+    git merge -q --ff-only origin/main
+    git rm -q api.token
+    git commit -qm "delete the already-published secret path"
+    rc="$(_rc git push -q origin main 2>"${ROOT}/o34")"
+    _check "deleting an already-published secret path is allowed" 0 "${rc}"
+    _expect_output "already-has warning shown for deletion" yes "remote already has" "${ROOT}/o34"
+
+    # v1.9 fix: the check stopped at the FIRST remote base (sorted by
+    # refname) that held the path, so branch sort order, not the actual
+    # publication history, decided whether a blob counted as known. seed
+    # two remote branches with two different blobs for the same
+    # secret-shaped path ("a" before "b" by refname), then push a brand-new
+    # third branch whose blob matches "b", the LATER-sorted one: it must
+    # still warn, because every base is now checked, not only the first.
+    _setup_repo
+    git push -q origin main 2>/dev/null
+    rm -rf "${ROOT}/hookless"
+    git clone -q "${ROOT}/remote.git" "${ROOT}/hookless"
+    (
+        cd "${ROOT}/hookless"
+        git config user.email "test@example.invalid"
+        git config user.name "test"
+        git config commit.gpgsign false
+        git checkout -qb a
+        printf 'A\n' > foo.key
+        git add foo.key
+        git commit -qm "blob A on branch a"
+        git push -q origin a
+        git checkout -qb b main
+        printf 'B\n' > foo.key
+        git add foo.key
+        git commit -qm "blob B on branch b"
+        git push -q origin b
+    )
+    git fetch -q origin
+    git checkout -qb c origin/main
+    printf 'B\n' > foo.key
+    git add foo.key
+    git commit -qm "same blob as origin/b, pushed as a new ref"
+    rc="$(_rc git push -q origin c 2>"${ROOT}/o35")"
+    _check "a new-ref blob matching a later-sorted remote branch warns, not blocks" 0 "${rc}"
+    _expect_output "already-has warning shown for the matching blob" yes "remote already has" "${ROOT}/o35"
+
+    # same two-branch base, but the pushed blob matches NEITHER: checking
+    # every base (the fix above) must not turn into "any base passes it".
+    git checkout -qb d origin/main
+    printf 'C\n' > foo.key
+    git add foo.key
+    git commit -qm "blob matching no base, pushed as a new ref"
+    rc="$(_rc git push -q origin d 2>"${ROOT}/o36")"
+    _check "a new-ref blob matching no base still blocks" 1 "${rc}"
+    _expect_output "unmatched blob reported as newly published" yes "newly published" "${ROOT}/o36"
+
+    # v1.8 low-severity cleanup: check-1's redaction excluded "/" from the
+    # userinfo character class, so a userinfo containing a slash broke the
+    # sed match entirely and the whole URL, token included, was echoed
+    # verbatim. exclude only "@", the delimiter that ends the userinfo.
+    _setup_repo
+    rc="$(_rc bash "${HOOK}" leaky "https://u%3Aghp_x/y@example.invalid/r.git" < /dev/null 2>"${ROOT}/o34")"
+    _check "credential URL with a slash in userinfo blocks the push" 1 "${rc}"
+    _expect_output "userinfo token fragment not echoed" no "ghp_x" "${ROOT}/o34"
+    _expect_output "userinfo redacted" yes "REDACTED" "${ROOT}/o34"
+
+    # v1.9 fix (item 2): a push target given as a bare URL ($1 with no
+    # configured remote name: git's own contract is "if a named remote is
+    # not being used both values will be the same") used to reach every
+    # output line that prints REMOTE_DISPLAY verbatim, including the
+    # "remote:" line inside a check-1 refusal: the one place a URL is most
+    # likely to carry the credential that triggered the refusal in the
+    # first place.
+    _setup_repo
+    rc="$(_rc bash "${HOOK}" "https://user:hunter2@example.invalid/r.git" "https://user:hunter2@example.invalid/r.git" < /dev/null 2>"${ROOT}/o40")"
+    _check "URL push target blocks the push" 1 "${rc}"
+    _expect_output "password not echoed when \$1 is the URL" no "hunter2" "${ROOT}/o40"
+    _expect_output "userinfo redacted" yes "REDACTED" "${ROOT}/o40"
+    _expect_output "host still identifiable" yes "example.invalid" "${ROOT}/o40"
+
+    # same fix, reached through a real push instead of a direct hook call.
+    # url.<base>.insteadOf rewrites the TRANSPORT target (so the push
+    # actually lands locally), but git still passes the ORIGINAL argument as
+    # $1; the rewritten $2 carries no credential, so this exercises
+    # REMOTE_DISPLAY on the "scanning" line independently of check 1.
+    _setup_repo
+    FAKE_URL="https://user:hunter2@example.invalid/r.git"
+    git config "url.file://${ROOT}/remote.git.insteadOf" "${FAKE_URL}"
+    rc="$(_rc git push -q "${FAKE_URL}" main 2>"${ROOT}/o41")"
+    _check "push to a URL target with insteadOf rewriting succeeds" 0 "${rc}"
+    _expect_output "password not echoed in the scanning line" no "hunter2" "${ROOT}/o41"
+    _expect_output "userinfo redacted in the scanning line" yes "REDACTED" "${ROOT}/o41"
+    _expect_output "host still identifiable in the scanning line" yes "example.invalid" "${ROOT}/o41"
+
+    # v1.9 fix (item 3): the PII sweep used to mask only URL userinfo before
+    # re-reading ADDED lines, so a blocked token sitting directly in front of
+    # an "@domain.tld" in plain, non-URL content printed the token in full a
+    # second time under an advisory heading.
+    _setup_repo
+    git push -q origin main 2>/dev/null
+    TOK_L="$(printf 'L%.0s' {1..36})"
+    printf 'contact=ghp_%s@example.invalid\n' "${TOK_L}" > pii-adjacent.txt
+    git add pii-adjacent.txt
+    git commit -qm "token immediately followed by an email-shaped domain"
+    rc="$(_rc git push -q origin main 2>"${ROOT}/o42")"
+    _check "token adjacent to an email domain blocks the push" 1 "${rc}"
+    _expect_output "full token not echoed under the PII heading" no "ghp_${TOK_L}" "${ROOT}/o42"
+    _expect_output "content scan still reports the token" yes "secret-shaped content" "${ROOT}/o42"
+
+    # the same fix must not turn the PII sweep into a no-op: a plain email
+    # with no adjacent secret pattern still warns.
+    _setup_repo
+    git push -q origin main 2>/dev/null
+    printf 'reach alice@example.invalid for details\n' > pii-plain.txt
+    git add pii-plain.txt
+    git commit -qm "plain personal email"
+    rc="$(_rc git push -q origin main 2>"${ROOT}/o43")"
+    _check "plain email push allowed" 0 "${rc}"
+    _expect_output "plain email still warned" yes "personal identifier" "${ROOT}/o43"
+
+    # v1.9 fix (item 4): a remote name carrying *, ?, [ or | changes how this
+    # hook scopes its OWN scan, as a glob in the new-ref exclusion
+    # (--glob=refs/remotes/NAME/*) or by breaking the "|"-packed range
+    # string, so it is refused outright before either mechanism runs.
+    # reachable via `git config remote.<name>.url` naming an odd remote,
+    # not just argv.
+    _setup_repo
+    git push -q origin main 2>/dev/null
+    git config "remote.*.url" "${ROOT}/remote.git"
+    rc="$(_rc git push '*' main 2>"${ROOT}/o44")"
+    _check "remote name '*' is refused" 1 "${rc}"
+    _expect_output "refusal names the scoping reason" yes "changes how this hook scopes its scan" "${ROOT}/o44"
+
+    _setup_repo
+    git push -q origin main 2>/dev/null
+    git config "remote.a|b.url" "${ROOT}/remote.git"
+    rc="$(_rc git push 'a|b' main 2>"${ROOT}/o45")"
+    _check "remote name 'a|b' is refused" 1 "${rc}"
+    _expect_output "refusal names the scoping reason" yes "changes how this hook scopes its scan" "${ROOT}/o45"
+
+    # an ordinary remote name is unaffected by the guard.
+    printf 'more3\n' >> readme.md
+    git commit -qam "more3"
+    rc="$(_rc git push -q origin main 2>"${ROOT}/o46")"
+    _check "ordinary remote name origin still allowed" 0 "${rc}"
+
+    # v1.9 fix (item 5): redact_url() and the check-1 refusal used to stop at
+    # the FIRST "@" in a userinfo, leaking everything after a second one.
+    _setup_repo
+    rc="$(_rc bash "${HOOK}" leaky "https://user:p@ss@example.invalid/r.git" < /dev/null 2>"${ROOT}/o47")"
+    _check "userinfo with a second @ blocks the push" 1 "${rc}"
+    _expect_output "password fragment before the second @ not echoed" no "p@ss" "${ROOT}/o47"
+    _expect_output "password tail after the second @ not echoed" no "ss@" "${ROOT}/o47"
+    _expect_output "userinfo redacted" yes "REDACTED" "${ROOT}/o47"
+
+    # the generic basic-auth pattern used to require a non-empty password, so
+    # "user:@host" was not basic-auth shaped; a token as the username with an
+    # empty password and an unescaped second "@" right after it matched
+    # neither the known-token pattern (needs "@" right after the token) nor
+    # the old basic-auth pattern.
+    TOK_M="$(printf 'M%.0s' {1..36})"
+    rc="$(_rc bash "${HOOK}" leaky "https://ghp_${TOK_M}:@x@example.invalid/r.git" < /dev/null 2>"${ROOT}/o48")"
+    _check "token userinfo with an empty password and a second @ blocks the push" 1 "${rc}"
+    _expect_output "token not echoed" no "ghp_${TOK_M}" "${ROOT}/o48"
+
+    # v1.9 fix (item 6): a fixture-marked line with trailing whitespace
+    # before its marker could not be exempted, because the diff-added
+    # unmarked copy kept its trailing spaces while the TIP copy's marker-strip
+    # trimmed them, and the whole-line compare never matched. "append the
+    # marker, do not reflow the line" means the trailing spaces the unmarked
+    # commit had stay right where they were.
+    _setup_repo
+    git push -q origin main 2>/dev/null
+    TOK_N="$(printf 'N%.0s' {1..36})"
+    printf 'TOKEN=ghp_%s   \n' "${TOK_N}" > ws-hash.sh
+    git add ws-hash.sh
+    git commit -qm "hash-comment fixture candidate, unmarked, trailing whitespace"
+    printf 'TOKEN=ghp_%s   # pre-push: fixture\n' "${TOK_N}" > ws-hash.sh
+    git add ws-hash.sh
+    git commit -qm "mark it, hash-comment form, trailing whitespace preserved"
+    rc="$(_rc git push -q origin main 2>"${ROOT}/o49")"
+    _check "fixture marked after trailing whitespace, hash-comment form, is honoured" 0 "${rc}"
+
+    _setup_repo
+    git push -q origin main 2>/dev/null
+    TOK_P="$(printf 'P%.0s' {1..36})"
+    printf 'TOKEN=ghp_%s   \n' "${TOK_P}" > ws-md.md
+    git add ws-md.md
+    git commit -qm "markdown fixture candidate, unmarked, trailing whitespace"
+    printf 'TOKEN=ghp_%s   <!-- pre-push: fixture -->\n' "${TOK_P}" > ws-md.md
+    git add ws-md.md
+    git commit -qm "mark it, markdown form, trailing whitespace preserved"
+    rc="$(_rc git push -q origin main 2>"${ROOT}/o50")"
+    _check "fixture marked after trailing whitespace, markdown form, is honoured" 0 "${rc}"
+
+    # the marker must END the line. A substring test exempted any added line
+    # that merely contained the text, so a real token could ride along in the
+    # part after it.
+    _setup_repo
+    git push -q origin main 2>/dev/null
+    TOK_M="$(printf 'M%.0s' {1..36})"
+    printf 'note pre-push: fixture and then TOKEN=ghp_%s\n' "${TOK_M}" > midline.sh
+    git add midline.sh
+    git commit -qm "marker mid-line with a live token after it"
+    rc="$(_rc git push -q origin main 2>"${ROOT}/o65")"
+    _check "a marker mid-line does not exempt what follows it" 1 "${rc}"
+
+    # the end-of-line rule must not start to require a comment introducer:
+    # whitespace alone before the marker still exempts the line.
+    _setup_repo
+    git push -q origin main 2>/dev/null
+    TOK_B="$(printf 'B%.0s' {1..36})"
+    printf 'TOKEN=ghp_%s   pre-push: fixture\n' "${TOK_B}" > bare.sh
+    git add bare.sh
+    git commit -qm "marker introduced by whitespace alone, no comment character"
+    rc="$(_rc git push -q origin main 2>"${ROOT}/o66")"
+    _check "a marker introduced by whitespace alone is still honoured" 0 "${rc}"
+
+    # same shape, never marked: the trim must not become a global weakening
+    # that exempts any token with trailing whitespace.
+    _setup_repo
+    git push -q origin main 2>/dev/null
+    TOK_Q="$(printf 'Q%.0s' {1..36})"
+    printf 'TOKEN=ghp_%s   \n' "${TOK_Q}" > ws-unmarked.sh
+    git add ws-unmarked.sh
+    git commit -qm "trailing whitespace, never marked"
+    rc="$(_rc git push -q origin main 2>"${ROOT}/o51")"
+    _check "unmarked token with trailing whitespace still blocked" 1 "${rc}"
+
+    # item 7: a failed rev-list (the common cause is a --force push whose
+    # remote sha was never fetched into this clone) must abort with a reason
+    # naming `git fetch`, not read as "0 commits, nothing to scan". this is
+    # the v1.4 fail-closed guard, not a v1.9 fix, so it predates the range
+    # under test above; it has simply never had a test of its own.
+    _setup_repo
+    git push -q origin main 2>/dev/null
+    LOCAL_SHA="$(git rev-parse HEAD)"
+    UNKNOWN_SHA="$(printf '%040d' 1234567890)"
+    rc="$(_rc bash "${HOOK}" origin "${ROOT}/remote.git" \
+        < <(printf '%s %s %s %s\n' "refs/heads/main" "${LOCAL_SHA}" "refs/heads/main" "${UNKNOWN_SHA}") \
+        2>"${ROOT}/o52")"
+    _check "an unfetched remote sha refuses the push" 1 "${rc}"
+    _expect_output "abort reason names fetching the remote" yes "fetch the remote" "${ROOT}/o52"
 
     printf '\n[info] %d passed, %d failed\n' "${_PASS}" "${_FAIL}"
     [[ "${_FAIL}" -eq 0 ]]

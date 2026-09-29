@@ -114,6 +114,15 @@ while IFS= read -r LINE || [[ -n "${LINE}" ]]; do
     shopt -u nocasematch
     fail_provenance "${LINE}"
   fi
+  # a marker in front of "generated with/by" (robot emoji, bullet) is the
+  # watermark shape every agent CLI emits, so it fails even when the tool
+  # named is not in AGENT_TOKENS: the list cannot be complete. prose starts
+  # with a letter and stays untouched. (merged from the develop line, which
+  # refused every generated-by line, 2026-09-28)
+  if [[ "${LINE}" =~ ^[[:space:]]*[^[:alnum:][:space:]]+[[:space:]]*generated[[:space:]]+(with|by)[[:space:]] ]]; then
+    shopt -u nocasematch
+    fail_provenance "${LINE}"
+  fi
   if [[ "${LINE}" =~ ^[[:space:]]*co-authored-by:.*(${AGENT_TOKENS}) ]]; then
     shopt -u nocasematch
     fail_provenance "${LINE}"
