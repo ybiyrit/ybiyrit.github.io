@@ -5,12 +5,12 @@
 #
 # ---
 # name: test-pre-push
-# version: v1.11
+# version: v1.15
 # created: 2026-08-02
 # created_by: cl-bs
-# updated: 2026-09-28
+# updated: 2026-09-29
 # updated_by: cl-bs
-# description: regression suite for .githooks/pre-push; builds throwaway repos in a tempdir and asserts what the hook blocks and what it lets through. v1.3 adds coverage for the fixture marker's markdown form and the new-ref path base, merged from the develop line into the v1.7 hook. v1.4 adds coverage for the eight v1.8 security fixes: basic-auth redaction (content scan and PII sweep), merge-commit scanning via first-parent diff, per-remote new-ref exclusion, the fixture marker's whole-line match, non-ASCII path scanning, the exact-path catalogue exclusion, content-aware already-published detection, and check-1 userinfo redaction with a slash. v1.5 adds coverage for the v1.9 already-published fix: a blob swapped to a real secret and back within one range still blocks, content recreated identical to the base blob still warns, a deletion-only range still warns, a new-ref blob matching a later-sorted remote branch still warns (not just the first-sorted one), and a new-ref blob matching no base still blocks. v1.6 adds coverage for the remaining v1.9 fixes that had none: a push target given as a bare URL redacts on every REMOTE_DISPLAY output line, not just the check-1 refusal; the PII sweep masks the full check-2 catalogue (not only URL userinfo) before re-reading ADDED content, so a token immediately followed by "@domain" is not printed twice; a remote name carrying a glob or pipe character is refused outright; redact_url() and the generic basic-auth URL pattern go greedy past a second userinfo "@" and accept an empty password; a fixture marker's trailing whitespace before the marker still exempts the line, in both comment and markdown form; and the fail-closed rev-list abort names `git fetch` when a --force push's remote sha is not yet in this clone. v1.9 merges the main line's suite (v1.7 to v1.8): check 3 on a PR forge with a parsed, case-folded host and trailing root dots, the long credential URL that outlasts the pipe buffer, a deletion that passes and an addition that still blocks, a rename to a harmless name that blocks, a quoted non-ASCII path and a file added in the merge commit itself. v1.10 adds the v2.0 lineage's case that main lacked: a fixture marker mid-line does not exempt the token after it.
+# description: regression suite for .githooks/pre-push; builds throwaway repos in a tempdir and asserts what the hook blocks and what it lets through. v1.3 adds coverage for the fixture marker's markdown form and the new-ref path base, merged from the develop line into the v1.7 hook. v1.4 adds coverage for the eight v1.8 security fixes: basic-auth redaction (content scan and PII sweep), merge-commit scanning via first-parent diff, per-remote new-ref exclusion, the fixture marker's whole-line match, non-ASCII path scanning, the exact-path catalogue exclusion, content-aware already-published detection, and check-1 userinfo redaction with a slash. v1.5 adds coverage for the v1.9 already-published fix: a blob swapped to a real secret and back within one range still blocks, content recreated identical to the base blob still warns, a deletion-only range still warns, a new-ref blob matching a later-sorted remote branch still warns (not just the first-sorted one), and a new-ref blob matching no base still blocks. v1.6 adds coverage for the remaining v1.9 fixes that had none: a push target given as a bare URL redacts on every REMOTE_DISPLAY output line, not just the check-1 refusal; the PII sweep masks the full check-2 catalogue (not only URL userinfo) before re-reading ADDED content, so a token immediately followed by "@domain" is not printed twice; a remote name carrying a glob or pipe character is refused outright; redact_url() and the generic basic-auth URL pattern go greedy past a second userinfo "@" and accept an empty password; a fixture marker's trailing whitespace before the marker still exempts the line, in both comment and markdown form; and the fail-closed rev-list abort names `git fetch` when a --force push's remote sha is not yet in this clone. v1.9 merges the main line's suite (v1.7 to v1.8): check 3 on a PR forge with a parsed, case-folded host and trailing root dots, the long credential URL that outlasts the pipe buffer, a deletion that passes and an addition that still blocks, a rename to a harmless name that blocks, a quoted non-ASCII path and a file added in the merge commit itself. v1.10 adds the v2.0 lineage's case that main lacked: a fixture marker mid-line does not exempt the token after it. v1.12 resolves a relative PRE_PUSH_HOOK before the first cd. v1.13 covers that relative branch with a case of its own. v1.14 makes that case end to end: a nested run with a relative candidate that records its calls. v1.15 lets the literal secret-scan companion follow the marker and proves a token after the companion still blocks.
 # type: test
 # ---
 #
@@ -50,7 +50,16 @@ IFS=$'\n\t'
 # Without the override, a candidate run silently re-tested the installed hook
 # and reported a pass for code it had never read. Measured 2026-09-28 while
 # grafting a hook the suite never saw.
-HOOK="${PRE_PUSH_HOOK:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/pre-push}"
+# absolute before any cd: _setup_repo changes into a throwaway repository,
+# where a relative candidate named nothing (design-system#99 review). a case
+# at the end covers the relative branch, which a bare run and make lint never
+# take.
+_absolute_path() {
+    if [[ "${1}" == /* ]]; then printf '%s' "${1}"; else printf '%s/%s' "${PWD}" "${1}"; fi
+}
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly SELF_DIR
+HOOK="$(_absolute_path "${PRE_PUSH_HOOK:-${SELF_DIR}/pre-push}")"
 readonly HOOK
 ROOT="$(mktemp -d)"
 readonly ROOT
@@ -901,6 +910,27 @@ main() {
     rc="$(_rc git push -q origin main 2>"${ROOT}/o66")"
     _check "a marker introduced by whitespace alone is still honoured" 0 "${rc}"
 
+    # the companion marker of secret-scan.sh may follow the fixture marker:
+    # ~/bin's lib-redact.sh wrote it that way in a published commit.
+    _setup_repo
+    git push -q origin main 2>/dev/null
+    TOK_C="$(printf 'C%.0s' {1..36})"
+    printf 'TOKEN=ghp_%s  # pre-push: fixture, secret-scan:allow\n' "${TOK_C}" > companion.sh
+    git add companion.sh
+    git commit -qm "fixture marker followed by the secret-scan companion"
+    rc="$(_rc git push -q origin main 2>"${ROOT}/o66c")"
+    _check "the secret-scan companion after the marker is honoured" 0 "${rc}"
+
+    # ... and only the companion: a token after it still blocks.
+    _setup_repo
+    git push -q origin main 2>/dev/null
+    TOK_E="$(printf 'E%.0s' {1..36})"
+    printf 'x  # pre-push: fixture, secret-scan:allow ghp_%s\n' "${TOK_E}" > companion-tail.sh
+    git add companion-tail.sh
+    git commit -qm "companion marker with a live token after it"
+    rc="$(_rc git push -q origin main 2>"${ROOT}/o66d")"
+    _check "a token after the companion marker still blocks" 1 "${rc}"
+
     # same shape, never marked: the trim must not become a global weakening
     # that exempts any token with trailing whitespace.
     _setup_repo
@@ -926,6 +956,30 @@ main() {
         2>"${ROOT}/o52")"
     _check "an unfetched remote sha refuses the push" 1 "${rc}"
     _expect_output "abort reason names fetching the remote" yes "fetch the remote" "${ROOT}/o52"
+
+    # a relative candidate reaches the hook, end to end: the suite runs again
+    # with a relative PRE_PUSH_HOOK naming a copy of the hook that records
+    # each call, and must pass with the record present. a bare run and make
+    # lint pass no candidate, so this is the one run that takes the relative
+    # branch (copilot reviews of research-academic#155 and talks#143). the
+    # nested run carries a candidate, so it does not nest again.
+    if [[ -z "${PRE_PUSH_HOOK:-}" ]]; then
+        mkdir "${ROOT}/candidate"
+        {
+            head -n 1 "${HOOK}"
+            printf ': > %q\n' "${ROOT}/candidate/called"
+            tail -n +2 "${HOOK}"
+        } > "${ROOT}/candidate/pre-push"
+        chmod +x "${ROOT}/candidate/pre-push"
+        if (cd "${ROOT}" && PRE_PUSH_HOOK=candidate/pre-push bash "${SELF_DIR}/${BASH_SOURCE[0]##*/}" >/dev/null 2>&1) \
+           && [[ -f "${ROOT}/candidate/called" ]]; then
+            printf '[pass] a relative PRE_PUSH_HOOK reaches the hook\n'
+            _PASS=$(( _PASS + 1 ))
+        else
+            printf '[fail] a relative PRE_PUSH_HOOK reaches the hook\n'
+            _FAIL=$(( _FAIL + 1 ))
+        fi
+    fi
 
     printf '\n[info] %d passed, %d failed\n' "${_PASS}" "${_FAIL}"
     [[ "${_FAIL}" -eq 0 ]]

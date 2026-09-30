@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # shellcheck shell=bash
-# pre-push hook v1.15 created 2605 cl-bs updated 2609 cl-bs
+# pre-push hook v1.17 created 2605 cl-bs updated 2609 cl-bs
 #
 # universal pre-push guard. three independent checks, all fail closed:
 #
@@ -59,6 +59,9 @@
 # `git push '*' ref`) either widened the `--glob=refs/remotes/NAME/*`
 # exclusion past that one remote or broke the `|`-packed range split.
 #
+# v1.17 (2026-09-30) lets the literal companion marker ", secret-scan:allow"
+# follow the fixture marker; any other text after it still blocks.
+#
 # v1.15 (2026-09-29) drops the exclusion for claude/plugins/bjoern-core,
 # which config 136a383 deleted; the pathspec matched nothing.
 #
@@ -90,10 +93,14 @@
 #      recorded default branch when the remote is a PR forge (github.com).
 #      ALLOW_PUSH_TO_MAIN=1 overrides once, deliberately.
 #
-# this file is the MASTER. `dotfiles.sh git-hooks --apply` mirrors it into
-# every discovered repo's .githooks/ and sets core.hooksPath, so extending
-# the catalogue here extends it everywhere. keep it self-contained: it runs
-# inside repos that cannot see ~/bin.
+# the master of this file is ~/config/.githooks/pre-push, and every other
+# copy is a mirror: `dotfiles.sh git-hooks --apply` copies the master into
+# every discovered repo's .githooks/ and sets core.hooksPath, so a change
+# belongs in the master, extends the catalogue everywhere, and an edit to a
+# mirror is overwritten on the next apply. the sentence used to read "this
+# file is the MASTER", which was false in every mirror it was copied into
+# (copilot review of research-general#141, 2026-09-29). keep it
+# self-contained: it runs inside repos that cannot see ~/bin.
 #
 # install: git config core.hooksPath .githooks   (per clone; dotfiles.sh does it)
 # bypass:  git push --no-verify   (git itself; nothing here can prevent that)
@@ -654,8 +661,13 @@ for (( RANGE_INDEX = 0; RANGE_INDEX < ${#RANGES[@]}; RANGE_INDEX++ )); do
     # corpus uses that form. Requiring an introducer would stop exempting
     # lines this hook has always exempted. Suffix position is the part that
     # carries the risk.
+    #
+    # The one exception is the literal companion marker of secret-scan.sh,
+    # ", secret-scan:allow": a fixed string cannot carry a token, and
+    # ~/bin's lib-redact.sh put it after this marker in 5b8abab, so the
+    # end-of-line rule refused every push of that published commit.
     SCANNED="$(printf '%s\n' "${ADDED}" \
-        | grep -vE -- "${FIXTURE_MARKER}[[:space:]]*(-->)?[[:space:]]*\$" || true)"
+        | grep -vE -- "${FIXTURE_MARKER}(,?[[:space:]]*secret-scan:allow)?[[:space:]]*(-->)?[[:space:]]*\$" || true)"
     # and the same line in its pre-marker form, per TIP_FIXTURES above. the
     # emptiness guard is load-bearing: an empty pattern list would feed grep a
     # blank line, which matches everything and would exempt the whole diff.
