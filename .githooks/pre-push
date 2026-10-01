@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # shellcheck shell=bash
-# pre-push hook v1.17 created 2605 cl-bs updated 2609 cl-bs
+# pre-push hook v1.20 created 2605 cl-bs updated 2610 cl-bs
 #
 # universal pre-push guard. three independent checks, all fail closed:
 #
@@ -16,10 +16,10 @@
 # push proceeds with a warning rather than a refusal. see the constant.
 #
 # v1.7 reconciles two histories that diverged after the same base commit:
-# reconcile/ds1-main hardened check 1 and every git call feeding a security
-# decision (guard_abort, the redacted credential in the refusal, the
-# catalogue path exclusion below); develop independently added the fixture
-# marker and the already-published-path distinction. Neither line carried
+# one line hardened check 1 and every git call feeding a security decision
+# (guard_abort, the redacted credential in the refusal, the catalogue path
+# exclusion below); the other independently added the fixture marker and
+# the already-published-path distinction. Neither line carried
 # the other's feature, so both apply here.
 #
 # v1.8 closes eight defects a security review found in v1.7: the PII sweep
@@ -59,11 +59,33 @@
 # `git push '*' ref`) either widened the `--glob=refs/remotes/NAME/*`
 # exclusion past that one remote or broke the `|`-packed range split.
 #
+# v1.20 (2026-10-01) closes a review of v1.18: .env template names with
+# another suffix (.env.dist, .env.template, .env.local.example) were refused;
+# a rename or copy detection that git skipped past diff.renameLimit passed
+# silently; a user diff prefix (diff.noprefix, diff.dstPrefix) broke the
+# fixture path key; and owner-specific setup left in the comments goes.
+#
+# v1.19 (2026-10-01) drops host, branch and directory names that mean
+# nothing outside the owner's machines from the comments; the hook is
+# mirrored into public repositories.
+#
+# v1.18 (2026-10-01) closes a review of v1.17, each case pinned in
+# test-pre-push.sh: a basic-auth password containing "@" left its tail for
+# the PII sweep to print; a token in a URL query string, and the ghu_, ghs_
+# and ghr_ prefixes in a userinfo, passed check 1; a fixture marker exempted
+# the same line in every file and every pushed ref; copies were never
+# detected; git C-quotes a name with a control character or a double quote
+# even with core.quotePath=false, and the closing quote hid the extension;
+# an unreadable stdin read as an empty push; .env.<suffix> was not
+# secret-shaped; git-lfs was chained only when the checkout, not a pushed
+# ref, used LFS; and an added line starting with "++" read as a "+++"
+# header and was never scanned.
+#
 # v1.17 (2026-09-30) lets the literal companion marker ", secret-scan:allow"
 # follow the fixture marker; any other text after it still blocks.
 #
-# v1.15 (2026-09-29) drops the exclusion for claude/plugins/bjoern-core,
-# which config 136a383 deleted; the pathspec matched nothing.
+# v1.15 (2026-09-29) drops the exclusion for a plugin directory that
+# config 136a383 deleted; the pathspec matched nothing.
 #
 # v1.14 (2026-09-28) takes the one fix the parallel v2.0 line had and this
 # one lacked: the fixture marker must end the line, so a live token after a
@@ -93,14 +115,15 @@
 #      recorded default branch when the remote is a PR forge (github.com).
 #      ALLOW_PUSH_TO_MAIN=1 overrides once, deliberately.
 #
-# the master of this file is ~/config/.githooks/pre-push, and every other
-# copy is a mirror: `dotfiles.sh git-hooks --apply` copies the master into
-# every discovered repo's .githooks/ and sets core.hooksPath, so a change
+# one repository holds the master of this file, and every other copy is a
+# mirror: a sync step copies the master into every discovered repo's
+# .githooks/ and sets core.hooksPath, so a change
 # belongs in the master, extends the catalogue everywhere, and an edit to a
 # mirror is overwritten on the next apply. the sentence used to read "this
 # file is the MASTER", which was false in every mirror it was copied into
 # (copilot review of research-general#141, 2026-09-29). keep it
-# self-contained: it runs inside repos that cannot see ~/bin.
+# self-contained: it runs inside repos that cannot reach any helper
+# outside themselves.
 #
 # install: git config core.hooksPath .githooks   (per clone; dotfiles.sh does it)
 # bypass:  git push --no-verify   (git itself; nothing here can prevent that)
@@ -199,9 +222,16 @@ fi
 # `<local-ref> <local-sha> <remote-ref> <remote-sha>` and they can only be
 # read once; the payload scan needs them, and git-lfs needs them replayed
 # verbatim if we chain to it at the end.
-REF_UPDATES=""
-if [[ ! -t 0 ]]; then
-    REF_UPDATES="$(cat || true)"
+#
+# fail closed: `cat || true` read a failed read (v1.17) as an empty update
+# list, which scans nothing and passes. git always feeds a pipe, so a
+# terminal on stdin means a manual run with arguments, which has no ref
+# updates to verify either.
+if [[ -t 0 ]]; then
+    guard_abort "stdin is a terminal, not git's ref-update list"
+fi
+if ! REF_UPDATES="$(cat)"; then
+    guard_abort "cannot read the ref-update list from stdin"
 fi
 
 # fall back to `git remote get-url` when $2 is empty (rare, but handles
@@ -215,7 +245,9 @@ fi
 
 DANGEROUS_URL_PATTERNS=(
   # known token formats inside an https URL userinfo segment
-  'https?://[^[:space:]/@]*(gho_|ghp_|github_pat_|glpat-)[A-Za-z0-9_-]+@'
+  # gh[pousr]_ is the full GitHub prefix set (personal, OAuth, user-to-server,
+  # server-to-server, refresh), the same class as the content catalogue.
+  'https?://[^[:space:]/@]*(gh[pousr]_|github_pat_|glpat-)[A-Za-z0-9_-]+@'
 
   # generic https basic-auth (user:password@); legitimate auth in 2026
   # uses credential helpers (libsecret) or ssh, never inline.
@@ -246,6 +278,11 @@ DANGEROUS_URL_PATTERNS=(
   # time (leak vehicle) or the URL is malformed; both cases warrant
   # blocking.
   'https?://[^[:space:]/@]*\$\{?[A-Za-z_][^[:space:]/@]*@'
+
+  # a credential in the query string, with no userinfo at all
+  # (`?access_token=`, `?private_token=`, `&client_secret=`). redact_url()
+  # already masked the query on output; until v1.18 nothing detected it.
+  'https?://[^[:space:]]*[?&][A-Za-z_-]*(token|secret|password|passwd|api_?key)=[^&#[:space:]]+'
 )
 
 # an unresolvable remote URL is not a pass: check 1 cannot run, and the whole
@@ -259,7 +296,8 @@ if [[ -n "${REMOTE_URL}" ]]; then
         # a here-string, not `printf | grep -q`: grep -q may exit on the first
         # match while printf still writes, and under pipefail the SIGPIPE would
         # read as "no match". (copilot review, languages#2.) not reproduced on
-        # fry1 at 100 KB; kept because a here-string has no writer to kill.
+        # one workstation at 100 KB; kept because a here-string has no
+        # writer to kill.
         if grep -qE -- "${PATTERN}" <<< "${REMOTE_URL}"; then
             # redact the userinfo before printing. this URL matched a
             # credential pattern, so by construction it CONTAINS the secret;
@@ -299,7 +337,12 @@ fi
 # up to the whole password when it is short, where every other pattern's
 # match is the secret itself and a slice of it is merely less of the same
 # secret, not a decodable fragment of a DIFFERENT one.
-readonly BASIC_AUTH_CONTENT_PATTERN=':[/][/][^[:space:]/@]+:[^[:space:]/@]+@'
+#
+# the password segment admits "@" and the match is leftmost-longest, so it
+# runs to the LAST "@" before whitespace or "/". until v1.18 it stopped at the
+# first one: `https://u:pw@tail@host` redacted `://u:pw@` and the PII sweep
+# then printed `tail@host`, the rest of the password, as an e-mail address.
+readonly BASIC_AUTH_CONTENT_PATTERN=':[/][/][^[:space:]/@]+:[^[:space:]/]+@'
 
 SECRET_CONTENT_PATTERNS=(
     'gh[pousr]_[A-Za-z0-9]{36,}'
@@ -325,8 +368,8 @@ SECRET_CONTENT_PATTERNS=(
 # walks `git log -p` over the whole push range, and every earlier revision in
 # that range still carries the pre-evasion spelling. so the hook blocks its
 # own history permanently: v1.2 ("stop the hook blocking its own adoption")
-# fixed the tip and the push stayed blocked, which is how ~/config reached 85
-# unpushed commits and ~/bin 80.
+# fixed the tip and the push stayed blocked, which is how two repositories
+# reached 85 and 80 unpushed commits.
 #
 # the exclusion is narrow by design. it drops content matching for the
 # known catalogue and fixture paths below; the FILENAME scan still covers
@@ -344,9 +387,9 @@ SECRET_CONTENT_PATTERNS=(
 # no directory component before the filename matches that basename at ANY
 # depth, so `**/check-hook-guards.sh` also excluded an attacker-planted
 # `anywhere/check-hook-guards.sh` from the content scan. every path below is
-# a real file confirmed via `git ls-files` in this repo, or (this hook is the
-# MASTER mirrored into every repo's .githooks/, per the file header) in
-# `~/bin`, the other repo that carries the same catalogue at different paths.
+# a real file confirmed via `git ls-files` in the repo holding the master,
+# or in a second repo that carries the same catalogue at different paths
+# (this hook is mirrored into every repo's .githooks/, per the file header).
 #
 # secret-content-patterns.txt is the pattern catalogue itself: it documents the
 # credential shapes it matches, so it matches itself. on 2026-09-07 its own
@@ -409,7 +452,14 @@ readonly FIXTURE_MARKER='pre-push: fixture'
 
 # secret-shaped FILENAMES and restricted stores. a file whose name says
 # "private key" is a leak regardless of what the content scan makes of it.
-readonly SECRET_PATH_PATTERN='(^|/)(id_rsa|id_ed25519|id_ecdsa|\.netrc|credentials\.json)$|\.(pem|key|p12|pfx|jks|keystore|kdbx|ovpn|token)$|(^|/)\.(env|secret)$|\.secret$|(^|/)(ssh|\.ssh|\.password-store|\.gnupg|\.gpg|\.cert|\.pki|\.dat)/|(ssh|gpg|git)\.zip$'
+#
+# `.env.<suffix>` (.env.local, .env.production) carries the same values as
+# `.env`. a name that ENDS in a template suffix is the exception, whatever
+# sits between: .env.example, .env.dist, .env.local.example. v1.18 allowed
+# only .env.example and .env.sample and refused the other templates that
+# v1.17 had passed.
+readonly SECRET_PATH_PATTERN='(^|/)(id_rsa|id_ed25519|id_ecdsa|\.netrc|credentials\.json)$|\.(pem|key|p12|pfx|jks|keystore|kdbx|ovpn|token)$|(^|/)\.(env|secret)$|(^|/)\.env\.[^/]+$|\.secret$|(^|/)(ssh|\.ssh|\.password-store|\.gnupg|\.gpg|\.cert|\.pki|\.dat)/|(ssh|gpg|git)\.zip$'
+readonly SECRET_PATH_ALLOW_PATTERN='(^|/)\.env(\.[^/]+)?\.(example|sample|template|dist)$'
 
 # personal identifiers. ADVISORY: reported, never blocking.
 PII_PATTERNS=(
@@ -420,13 +470,12 @@ PII_PATTERNS=(
 
 # check 3: refuse a direct push to the default branch.
 #
-# The repo conventions say updates land via PR and that "direct push is
-# blocked at GitHub level". That was not true: branch protection on both
-# ybiyrit/research-academic and ybiyrit/design-system carries
-# enforce_admins=false, so the owner pushing to main is waved through and
-# the API still answers "protected: true". A protection that exempts the
-# only person who uses the repo is decorative, and on 2026-09-08 a commit
-# reached design-system main that way without review.
+# A repo convention can say updates land via PR and that "direct push is
+# blocked at GitHub level" while branch protection does not include
+# administrators: the owner pushing to main is then waved through and the
+# API still answers "protected: true". A protection that exempts the only
+# person who uses the repo is decorative, and a commit has reached main
+# that way without review.
 #
 # This is the local half of the fix, and it fires before the network round
 # trip. The server half is `enforce_admins`, which has to be set per repo.
@@ -443,11 +492,10 @@ DEFAULT_BRANCH_RE='^refs/heads/(main|master)$'
 # here would add a network round trip to every push.
 REMOTE_DEFAULT="$(git symbolic-ref -q --short "refs/remotes/${REMOTE_NAME}/HEAD" 2>/dev/null || true)"
 REMOTE_DEFAULT="${REMOTE_DEFAULT#"${REMOTE_NAME}"/}"
-# only on a forge that has pull requests. ~/config, ~/bin and the other
-# dotfiles repos push main straight to a private git remote on the NAS,
-# where there is no PR to land through; refusing there would break the
-# ordinary workflow of 30-odd repos to enforce a rule that does not apply
-# to them.
+# only on a forge that has pull requests. a private repo that pushes main
+# straight to a self-hosted git remote has no PR to land through; refusing
+# there would break its ordinary workflow to enforce a rule that does not
+# apply to it.
 # the host, parsed and case-folded. the old `*github.com*` substring let
 # git@GITHUB.COM:o/r through (claude#3); v1.7's boundary regex still matched
 # github.com as a PATH segment, https://git.example/github.com/r (fleet
@@ -563,14 +611,32 @@ done <<< "${REF_UPDATES}"
 # the marker, because the strip has to reproduce the original line exactly.
 # `<!-- pre-push: fixture -->` is the markdown form: the memory corpus
 # tabulates these patterns in prose, where a bare `#` is not a comment.
-TIP_FIXTURES=""
-for SHA in "${TIP_SHAS[@]}"; do
-    TIP_FIXTURES="${TIP_FIXTURES}$(git grep -h -F -- "${FIXTURE_MARKER}" "${SHA}" 2>/dev/null || true)"$'\n'
-done
-# strip the marker and any comment introducer left dangling before it, trim,
-# drop anything too short to identify a line on its own (a 3-character
-# pattern would exempt half the diff), then re-prefix with "+" so each
-# pattern reads as a whole ADDED diff line, not a bare fragment of one.
+#
+# Each entry is "<path><TAB>+<text>" and is read per ref (v1.18). Until then
+# one pooled list served every file and every ref of the push, so a line
+# marked in a.sh also exempted the identical unmarked line in b.sh, and a
+# marker on one branch exempted another branch whose tip never carried it.
+# A path git would quote in the diff header (a tab, a double quote) does not
+# match its raw git-grep name; the line then stays in the scan, which is the
+# safe direction.
+tip_fixtures() {
+    local sha="${1}" name line
+    while IFS= read -r -d '' name && IFS= read -r line; do
+        printf '%s\t%s\n' "${name#"${sha}":}" "${line}"
+    done < <(git grep -z -F -e "${FIXTURE_MARKER}" "${sha}" 2>/dev/null || true) \
+        | sed "s/${FIXTURE_MARKER}.*$//" \
+        | sed -E 's/[[:space:]]*<!--[[:space:]]*$//' \
+        | sed 's/[[:space:]]*[#;]*[[:space:]]*$//' \
+        | sed -E 's/[[:space:]]+$//' \
+        | awk '{ t = $0; sub(/^[^\t]*\t/, "", t); if (length(t) >= 12) print }' \
+        | sed 's/\t/\t+/' \
+        | sort -u || true
+}
+# tip_fixtures() strips the marker and any comment introducer left dangling
+# before it, trims, drops a text too short to identify a line on its own (a
+# 3-character pattern would exempt half the diff), then re-prefixes the text
+# with "+" so each pattern reads as a whole ADDED diff line, not a bare
+# fragment of one.
 #
 # the explicit trailing-whitespace trim is not redundant with the comment
 # strip above it: that strip only removes a trailing run of `#`/`;` and the
@@ -582,18 +648,14 @@ done
 # meaningful trailing whitespace with NO `#`/`;` at all would not be
 # touched by that pattern. trim unconditionally rather than rely on the
 # comment-strip's incidental coverage.
-TIP_FIXTURES="$(printf '%s\n' "${TIP_FIXTURES}" \
-    | sed "s/${FIXTURE_MARKER}.*$//" \
-    | sed -E 's/[[:space:]]*<!--[[:space:]]*$//' \
-    | sed 's/[[:space:]]*[#;]*[[:space:]]*$//' \
-    | sed -E 's/[[:space:]]+$//' \
-    | awk 'length($0) >= 12' \
-    | sed 's/^/+/' \
-    | sort -u || true)"
-
 if [[ "${#RANGES[@]}" -eq 0 ]]; then
     exit 0
 fi
+
+# stderr of the filename walk, read for git's rename-limit warning.
+GIT_STDERR="$(mktemp)"
+readonly GIT_STDERR
+trap 'rm -f "${GIT_STDERR}"' EXIT
 
 printf '[info] pre-push: scanning %d ref update(s) to %s\n' "${#RANGES[@]}" "${REMOTE_DISPLAY}" >&2
 
@@ -640,11 +702,25 @@ for (( RANGE_INDEX = 0; RANGE_INDEX < ${#RANGES[@]}; RANGE_INDEX++ )); do
     # then `git add`) was never diffed and never scanned. first-parent still
     # shows exactly what the merge changed relative to the branch it landed
     # on, which is what "published" means here. verified on git 2.43.
-    if ! DIFF_RAW="$(git log -p --no-color --diff-merges=first-parent --unified=0 "${LIMIT[@]}" "${ARGS[@]}" \
+    # explicit prefixes: the fixture path key below is read from the
+    # "+++ b/" header, and diff.noprefix or diff.dstPrefix in the user's
+    # config changed that header, so no fixture marker matched (v1.18).
+    if ! DIFF_RAW="$(git -c core.quotePath=false log -p --no-color --src-prefix=a/ --dst-prefix=b/ \
+        --diff-merges=first-parent --unified=0 "${LIMIT[@]}" "${ARGS[@]}" \
         -- . "${SCAN_EXCLUDE_PATHS[@]}" 2>/dev/null)"; then
         guard_abort "git log -p failed for range '${ARGS[0]}'; the content scan did not run"
     fi
-    ADDED="$(printf '%s\n' "${DIFF_RAW}" | grep -E '^\+' | grep -vE '^\+\+\+' || true)"
+    # every added line as "<path><TAB>+<text>". a "+++ b/<path>" header is
+    # recognised only between "diff --git" and the first "@@": the v1.17
+    # filter dropped every line starting with "+++", so an added line whose
+    # own text starts with "++" was never scanned. git appends a tab to a
+    # header path that contains a space; it is not part of the name.
+    ADDED_P="$(printf '%s\n' "${DIFF_RAW}" | awk '
+        /^diff --git / { hdr = 1; path = ""; next }
+        hdr && /^\+\+\+ / { path = substr($0, 5); sub(/\t$/, "", path); sub(/^b\//, "", path); next }
+        /^@@/ { hdr = 0; next }
+        !hdr && /^\+/ { print path "\t" $0 }')"
+    ADDED="$(printf '%s\n' "${ADDED_P}" | cut -f2-)"
 
     # drop fixture-marked lines before the blocking scan only. PII below still
     # reads ADDED, so an exempted line is reported there if it carries an
@@ -664,13 +740,15 @@ for (( RANGE_INDEX = 0; RANGE_INDEX < ${#RANGES[@]}; RANGE_INDEX++ )); do
     #
     # The one exception is the literal companion marker of secret-scan.sh,
     # ", secret-scan:allow": a fixed string cannot carry a token, and
-    # ~/bin's lib-redact.sh put it after this marker in 5b8abab, so the
-    # end-of-line rule refused every push of that published commit.
-    SCANNED="$(printf '%s\n' "${ADDED}" \
+    # a redaction library put it after this marker in a published commit,
+    # so the end-of-line rule refused every push of that commit.
+    SCANNED="$(printf '%s\n' "${ADDED_P}" \
         | grep -vE -- "${FIXTURE_MARKER}(,?[[:space:]]*secret-scan:allow)?[[:space:]]*(-->)?[[:space:]]*\$" || true)"
-    # and the same line in its pre-marker form, per TIP_FIXTURES above. the
-    # emptiness guard is load-bearing: an empty pattern list would feed grep a
-    # blank line, which matches everything and would exempt the whole diff.
+    # and the same line in its pre-marker form, per TIP_FIXTURES above, read
+    # from this ref's own tip only. the emptiness guard is load-bearing: an
+    # empty pattern list would feed grep a blank line, which matches
+    # everything and would exempt the whole diff.
+    TIP_FIXTURES="$(tip_fixtures "${TIP_SHAS[RANGE_INDEX]}")"
     if [[ -n "${TIP_FIXTURES}" ]]; then
         # -x: whole-line match. TIP_FIXTURES patterns carry the "+" prefix
         # added above, so this drops an ADDED line only when it is
@@ -690,6 +768,7 @@ for (( RANGE_INDEX = 0; RANGE_INDEX < ${#RANGES[@]}; RANGE_INDEX++ )); do
             | sed -E 's/[[:space:]]+$//' \
             | grep -vxFf <(printf '%s\n' "${TIP_FIXTURES}") || true)"
     fi
+    SCANNED="$(printf '%s\n' "${SCANNED}" | cut -f2-)"
 
     if [[ -n "${ADDED}" ]]; then
         for PATTERN in "${SECRET_CONTENT_PATTERNS[@]}"; do
@@ -744,21 +823,72 @@ for (( RANGE_INDEX = 0; RANGE_INDEX < ${#RANGES[@]}; RANGE_INDEX++ )); do
     # --diff-merges=first-parent as the content walk, for the same reason: a
     # secret-shaped path added only while resolving a merge must still show.
     #
-    # core.quotePath=false: git otherwise renders a non-ASCII path as a
-    # double-quoted C-style octal escape ("\303\244-key.pem"), which puts a
-    # closing quote right after the extension and defeats every `\.ext$`
-    # branch of SECRET_PATH_PATTERN below.
+    # -z: git otherwise renders a non-ASCII path as a double-quoted C-style
+    # octal escape ("\303\244-key.pem"), which puts a closing quote right
+    # after the extension and defeats every `\.ext$` branch of
+    # SECRET_PATH_PATTERN below. core.quotePath=false (v1.8 to v1.17) cured
+    # non-ASCII only: a control character or a double quote in a name is
+    # quoted regardless, so `quo"te.pem` still escaped the pattern. -z prints
+    # every name raw; tr turns the NUL separators into newlines and a raw
+    # newline inside a name into \001, which the control-character check
+    # below then refuses.
     #
-    # name-status with rename detection, not name-only: a rename or copy
-    # counts under BOTH names, so `git mv id_rsa backup.txt` still lists
-    # id_rsa (claude-bocuse#6 review, main line v1.10). a deletion stays
-    # listed as well: the already-published check below reads it as content
-    # the remote already has, which is the remediation and passes.
-    if ! PATHS_STATUS="$(git -c core.quotePath=false log --name-status -M --pretty=format: \
-        --diff-merges=first-parent "${LIMIT[@]}" "${ARGS[@]}" 2>/dev/null)"; then
+    # name-status with rename AND copy detection, not name-only: a rename or
+    # copy counts under BOTH names, so `git mv id_rsa backup.txt` still lists
+    # id_rsa (claude-bocuse#6 review, main line v1.10). -M alone (v1.10 to
+    # v1.17) never reports a copy, so the C arms below were unreachable;
+    # --find-copies-harder also takes an unmodified source, which is the
+    # `cp id_rsa backup.txt` case. its cost grows with tree size times added
+    # files. measured 2026-10-01 over 300 commits: 2.7 s against 0.11 s for
+    # -M alone on a 1098-file tree, 3.8 s against 0.08 s on a 648-file tree;
+    # the whole hook took 8 to 10 s where v1.17 took 5 to 7 s. a deletion
+    # stays listed as well: the already-published check below reads it as
+    # content the remote already has, which is the remediation and passes.
+    #
+    # past diff.renameLimit git skips the exhaustive part of rename and copy
+    # detection and says so only on stderr, which v1.18 discarded: an edited
+    # key renamed to a harmless name then read as a delete plus an unrelated
+    # add. the warning now refuses the push. LC_ALL=C keeps the warning
+    # text matchable under a translated git.
+    if ! PATHS_TOKENS="$(LC_ALL=C git log -z --name-status -M -C --find-copies-harder --pretty=format: \
+        --diff-merges=first-parent "${LIMIT[@]}" "${ARGS[@]}" 2>"${GIT_STDERR}" | tr '\000\n' '\n\001')"; then
         guard_abort "git log --name-status failed for range '${ARGS[0]}'; the filename scan did not run"
     fi
-    PATHS_RAW="$(printf '%s\n' "${PATHS_STATUS}" | awk -F'\t' '
+    if grep -q -- 'due to too many files' "${GIT_STDERR}"; then
+        guard_abort "git skipped rename or copy detection for range '${ARGS[0]}', so a renamed secret-shaped path could pass under a new name; raise diff.renameLimit as git suggests: $(tr '\n' ' ' < "${GIT_STDERR}")"
+    fi
+    # rebuild "status<TAB>path[<TAB>path]" records. an empty token separates
+    # commits. a name with a control character is refused outright and never
+    # echoed raw: it can rewrite the terminal the refusal is read on, and no
+    # legitimate file needs one.
+    PATHS_STATUS=""
+    CTRL_PATHS=""
+    NEED=0
+    RECORD=""
+    while IFS= read -r TOKEN; do
+        if (( NEED == 0 )); then
+            [[ -z "${TOKEN}" ]] && continue
+            RECORD="${TOKEN}"
+            if [[ "${TOKEN}" =~ ^[RC] ]]; then NEED=2; else NEED=1; fi
+            continue
+        fi
+        if [[ "${TOKEN}" == *[[:cntrl:]]* ]]; then
+            CTRL_PATHS="${CTRL_PATHS}$(printf '%s' "${TOKEN}" | LC_ALL=C tr '\001-\037\177' '?')"$'\n'
+            RECORD=""
+        elif [[ -n "${RECORD}" ]]; then
+            RECORD="${RECORD}"$'\t'"${TOKEN}"
+        fi
+        NEED=$(( NEED - 1 ))
+        if (( NEED == 0 )) && [[ -n "${RECORD}" ]]; then
+            PATHS_STATUS="${PATHS_STATUS}${RECORD}"$'\n'
+        fi
+    done <<< "${PATHS_TOKENS}"
+    if [[ -n "${CTRL_PATHS}" ]]; then
+        printf '[error] pre-push: path(s) with a control character, shown with ? for each:\n' >&2
+        printf '%s' "${CTRL_PATHS}" | sort -u | sed 's/^/[error]   /' >&2
+        FOUND=$(( FOUND + 1 ))
+    fi
+    PATHS_RAW="$(printf '%s' "${PATHS_STATUS}" | awk -F'\t' '
         $1 == "" { next }
         $1 ~ /^[RC]/ { print $2; print $3; next }
         { print $2 }')"
@@ -771,15 +901,17 @@ for (( RANGE_INDEX = 0; RANGE_INDEX < ${#RANGES[@]}; RANGE_INDEX++ )); do
     RENAMED_SECRETS=""
     while IFS=$'\t' read -r _STATUS SRC DST; do
         [[ "${_STATUS}" =~ ^[RC] ]] || continue
-        if grep -qE -- "${SECRET_PATH_PATTERN}" <<< "${SRC}"; then
-            RENAMED_SECRETS="${RENAMED_SECRETS}${SRC}"$'\t'"${DST}"$'\n'
+        if grep -qE -- "${SECRET_PATH_PATTERN}" <<< "${SRC}" \
+            && ! grep -qE -- "${SECRET_PATH_ALLOW_PATTERN}" <<< "${SRC}"; then
+            if [[ "${_STATUS}" == C* ]]; then VERB="copied"; else VERB="renamed"; fi
+            RENAMED_SECRETS="${RENAMED_SECRETS}${SRC}"$'\t'"${VERB}"$'\t'"${DST}"$'\n'
         fi
     done <<< "${PATHS_STATUS}"
     if [[ -n "${RENAMED_SECRETS}" ]]; then
-        printf '[error] pre-push: secret-shaped path(s) renamed, content published under a new name:\n' >&2
-        while IFS=$'\t' read -r SRC DST; do
+        printf '[error] pre-push: secret-shaped path(s) renamed or copied, content published under a new name:\n' >&2
+        while IFS=$'\t' read -r SRC VERB DST; do
             [[ -z "${SRC}" ]] && continue
-            printf '[error]   %s renamed to %s\n' "${SRC}" "${DST}" >&2
+            printf '[error]   %s %s to %s\n' "${SRC}" "${VERB}" "${DST}" >&2
         done <<< "${RENAMED_SECRETS}"
         FOUND=$(( FOUND + 1 ))
     fi
@@ -795,14 +927,16 @@ for (( RANGE_INDEX = 0; RANGE_INDEX < ${#RANGES[@]}; RANGE_INDEX++ )); do
             printf '%s\n' "${SKIPPED_CONTENT}" | sed 's/^/[info]   /' >&2
         fi
 
-        BAD_PATHS="$(printf '%s\n' "${PATHS}" | grep -E -- "${SECRET_PATH_PATTERN}" || true)"
+        BAD_PATHS="$(printf '%s\n' "${PATHS}" | grep -E -- "${SECRET_PATH_PATTERN}" \
+            | grep -vE -- "${SECRET_PATH_ALLOW_PATTERN}" || true)"
         if [[ -n "${BAD_PATHS}" ]]; then
             # a path the remote already carries was published by an earlier
             # push. blocking on it again cannot un-publish it, and since the
             # name-only walk also lists paths the range DELETES, the repo
-            # would stay unpushable for as long as the range exists: ~/config
-            # tracks ssh/config and deleted ssh/known_hosts, which pinned
-            # develop 47 commits ahead of every remote. Measured 2026-09-21.
+            # would stay unpushable for as long as the range exists: a repo
+            # that once published a file under a secret-shaped directory and
+            # later deleted it stayed 47 commits ahead of every remote.
+            # Measured 2026-09-21.
             # What this push newly publishes is still blocked, and the content
             # scan above still reads key material in a known path.
             NEW_BAD=""
@@ -811,7 +945,7 @@ for (( RANGE_INDEX = 0; RANGE_INDEX < ${#RANGES[@]}; RANGE_INDEX++ )); do
             # this remote already has. with push.default=current a local
             # branch whose upstream has another name pushes as a new ref, and
             # a path both remote branches carried read as newly published.
-            # Measured 2026-09-23 on ~/bin awake-synology-local.
+            # Measured 2026-09-23.
             BASES=()
             if [[ -n "${RANGE_BASE}" ]]; then
                 BASES=("${RANGE_BASE}")
@@ -922,14 +1056,29 @@ printf '[pass] pre-push: no secret-shaped content or path detected\n' >&2
 # while keeping the security check ahead of it. the buffered ref updates are
 # replayed on its stdin, since this hook already consumed them. if either
 # side is missing, this block is a no-op (security check is sufficient).
-if command -v git-lfs >/dev/null 2>&1; then
-    if git config --get-regexp '^lfs\.' >/dev/null 2>&1 \
-       || (git rev-parse --show-toplevel >/dev/null 2>&1 \
-           && [[ -f "$(git rev-parse --show-toplevel)/.gitattributes" ]] \
-           && grep -q "filter=lfs" "$(git rev-parse --show-toplevel)/.gitattributes"); then
-        printf '%s\n' "${REF_UPDATES}" | git lfs pre-push "$@"
-        exit $?
+#
+# LFS use is read from the .gitattributes of every PUSHED tip, at any depth.
+# v1.17 read the checkout, so pushing an LFS branch from a non-LFS checkout
+# (or from a bare repository) skipped the upload and published pointers to
+# objects the remote never received. a git grep error (rc > 1) counts as
+# LFS: git-lfs then reports the problem itself.
+USES_LFS=0
+if git config --get-regexp '^lfs\.' >/dev/null 2>&1; then
+    USES_LFS=1
+fi
+for SHA in "${TIP_SHAS[@]}"; do
+    if (( USES_LFS )); then
+        break
     fi
+    LFS_RC=0
+    git grep -q -F -e 'filter=lfs' "${SHA}" -- .gitattributes '*/.gitattributes' 2>/dev/null || LFS_RC=$?
+    if [[ "${LFS_RC}" -ne 1 ]]; then
+        USES_LFS=1
+    fi
+done
+if (( USES_LFS )) && command -v git-lfs >/dev/null 2>&1; then
+    printf '%s\n' "${REF_UPDATES}" | git lfs pre-push "$@"
+    exit $?
 fi
 
 exit 0

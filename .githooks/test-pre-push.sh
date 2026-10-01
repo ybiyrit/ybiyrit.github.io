@@ -5,12 +5,12 @@
 #
 # ---
 # name: test-pre-push
-# version: v1.15
+# version: v1.18
 # created: 2026-08-02
 # created_by: cl-bs
-# updated: 2026-09-29
+# updated: 2026-10-01
 # updated_by: cl-bs
-# description: regression suite for .githooks/pre-push; builds throwaway repos in a tempdir and asserts what the hook blocks and what it lets through. v1.3 adds coverage for the fixture marker's markdown form and the new-ref path base, merged from the develop line into the v1.7 hook. v1.4 adds coverage for the eight v1.8 security fixes: basic-auth redaction (content scan and PII sweep), merge-commit scanning via first-parent diff, per-remote new-ref exclusion, the fixture marker's whole-line match, non-ASCII path scanning, the exact-path catalogue exclusion, content-aware already-published detection, and check-1 userinfo redaction with a slash. v1.5 adds coverage for the v1.9 already-published fix: a blob swapped to a real secret and back within one range still blocks, content recreated identical to the base blob still warns, a deletion-only range still warns, a new-ref blob matching a later-sorted remote branch still warns (not just the first-sorted one), and a new-ref blob matching no base still blocks. v1.6 adds coverage for the remaining v1.9 fixes that had none: a push target given as a bare URL redacts on every REMOTE_DISPLAY output line, not just the check-1 refusal; the PII sweep masks the full check-2 catalogue (not only URL userinfo) before re-reading ADDED content, so a token immediately followed by "@domain" is not printed twice; a remote name carrying a glob or pipe character is refused outright; redact_url() and the generic basic-auth URL pattern go greedy past a second userinfo "@" and accept an empty password; a fixture marker's trailing whitespace before the marker still exempts the line, in both comment and markdown form; and the fail-closed rev-list abort names `git fetch` when a --force push's remote sha is not yet in this clone. v1.9 merges the main line's suite (v1.7 to v1.8): check 3 on a PR forge with a parsed, case-folded host and trailing root dots, the long credential URL that outlasts the pipe buffer, a deletion that passes and an addition that still blocks, a rename to a harmless name that blocks, a quoted non-ASCII path and a file added in the merge commit itself. v1.10 adds the v2.0 lineage's case that main lacked: a fixture marker mid-line does not exempt the token after it. v1.12 resolves a relative PRE_PUSH_HOOK before the first cd. v1.13 covers that relative branch with a case of its own. v1.14 makes that case end to end: a nested run with a relative candidate that records its calls. v1.15 lets the literal secret-scan companion follow the marker and proves a token after the companion still blocks.
+# description: regression suite for .githooks/pre-push; builds throwaway repos in a tempdir and asserts what the hook blocks and what it lets through. v1.3 adds coverage for the fixture marker's markdown form and the new-ref path base, merged from a parallel line into the v1.7 hook. v1.4 adds coverage for the eight v1.8 security fixes: basic-auth redaction (content scan and PII sweep), merge-commit scanning via first-parent diff, per-remote new-ref exclusion, the fixture marker's whole-line match, non-ASCII path scanning, the exact-path catalogue exclusion, content-aware already-published detection, and check-1 userinfo redaction with a slash. v1.5 adds coverage for the v1.9 already-published fix: a blob swapped to a real secret and back within one range still blocks, content recreated identical to the base blob still warns, a deletion-only range still warns, a new-ref blob matching a later-sorted remote branch still warns (not just the first-sorted one), and a new-ref blob matching no base still blocks. v1.6 adds coverage for the remaining v1.9 fixes that had none: a push target given as a bare URL redacts on every REMOTE_DISPLAY output line, not just the check-1 refusal; the PII sweep masks the full check-2 catalogue (not only URL userinfo) before re-reading ADDED content, so a token immediately followed by "@domain" is not printed twice; a remote name carrying a glob or pipe character is refused outright; redact_url() and the generic basic-auth URL pattern go greedy past a second userinfo "@" and accept an empty password; a fixture marker's trailing whitespace before the marker still exempts the line, in both comment and markdown form; and the fail-closed rev-list abort names `git fetch` when a --force push's remote sha is not yet in this clone. v1.9 merges the main line's suite (v1.7 to v1.8): check 3 on a PR forge with a parsed, case-folded host and trailing root dots, the long credential URL that outlasts the pipe buffer, a deletion that passes and an addition that still blocks, a rename to a harmless name that blocks, a quoted non-ASCII path and a file added in the merge commit itself. v1.10 adds the v2.0 lineage's case that main lacked: a fixture marker mid-line does not exempt the token after it. v1.12 resolves a relative PRE_PUSH_HOOK before the first cd. v1.13 covers that relative branch with a case of its own. v1.14 makes that case end to end: a nested run with a relative candidate that records its calls. v1.15 lets the literal secret-scan companion follow the marker and proves a token after the companion still blocks. v1.16 pins the hook v1.18 fixes: a basic-auth password with an "@", query-string and ghu_/ghs_/ghr_ URL credentials, fixture markers scoped to their file and ref, copy detection, control characters and double quotes in names, an unreadable stdin, .env.<suffix> files, git-lfs for a pushed LFS ref and a token on a line starting with "++". v1.17 drops internal host names from the comments. v1.18 pins the hook v1.20 fixes: .env template names with any suffix, a refused push when git skips rename detection, and fixture keys under a user diff prefix.
 # type: test
 # ---
 #
@@ -306,7 +306,8 @@ main() {
 
     # v1.7: a credential URL long enough to outlast the pipe buffer. a
     # regression guard for the here-string: the SIGPIPE pass it prevents was
-    # not reproduced against v1.6 on fry1, so this case passes on both.
+    # not reproduced against v1.6 on one workstation, so this case passes
+    # on both.
     # the credential sits early and a long path follows, so grep matches in
     # its first read and exits while printf is still writing; 100000 bytes
     # outlast the 64 KiB pipe buffer and stay under the 128 KiB argv limit
@@ -911,7 +912,7 @@ main() {
     _check "a marker introduced by whitespace alone is still honoured" 0 "${rc}"
 
     # the companion marker of secret-scan.sh may follow the fixture marker:
-    # ~/bin's lib-redact.sh wrote it that way in a published commit.
+    # a redaction library wrote it that way in a published commit.
     _setup_repo
     git push -q origin main 2>/dev/null
     TOK_C="$(printf 'C%.0s' {1..36})"
@@ -956,6 +957,199 @@ main() {
         2>"${ROOT}/o52")"
     _check "an unfetched remote sha refuses the push" 1 "${rc}"
     _expect_output "abort reason names fetching the remote" yes "fetch the remote" "${ROOT}/o52"
+
+    # v1.16 (hook v1.18): the review findings on hook v1.17.
+    local TOK_H
+    TOK_H="$(printf 'H%.0s' {1..36})"
+
+    # (a) a password containing "@": the content redaction stopped at the
+    # first "@", and the PII sweep printed the rest as an e-mail address.
+    _setup_repo
+    git push -q origin main 2>/dev/null
+    printf 'url = https://user:pw@tailsecret9@example.invalid/r\n' > at-pass.txt
+    git add at-pass.txt
+    git commit -qm "basic-auth password with an at sign"
+    rc="$(_rc git push -q origin main 2>"${ROOT}/h1")"
+    _check "(a) basic-auth URL with an @ in the password blocks" 1 "${rc}"
+    _expect_output "(a) password tail not echoed" no "tailsecret9" "${ROOT}/h1"
+
+    # (b) a token in the query string, with no userinfo at all
+    for QS in "access_token=${TOK_H}" "token=${TOK_H}" "private_token=${TOK_H}"; do
+        rc="$(_rc bash "${HOOK}" leaky "https://example.invalid/r.git?${QS}" < /dev/null 2>"${ROOT}/h2")"
+        _check "(b) query-string credential '${QS%%=*}=' blocks" 1 "${rc}"
+        _expect_output "(b) query-string token not echoed" no "${TOK_H}" "${ROOT}/h2"
+    done
+
+    # (c) a fixture marked in one file exempts that file only
+    _setup_repo
+    git push -q origin main 2>/dev/null
+    printf 'TOKEN=ghp_%s  # pre-push: fixture\n' "${TOK_H}" > marked.sh
+    printf 'TOKEN=ghp_%s\n' "${TOK_H}" > other.sh
+    git add marked.sh other.sh
+    git commit -qm "same token, marked in one file only"
+    rc="$(_rc git push -q origin main 2>"${ROOT}/h3")"
+    _check "(c) a fixture marker does not exempt another file" 1 "${rc}"
+
+    # (c) and the tip of one ref does not exempt another ref
+    _setup_repo
+    git push -q origin main 2>/dev/null
+    git switch -q -c unmarked
+    printf 'TOKEN=ghp_%s\n' "${TOK_H}" > same.sh
+    git add same.sh
+    git commit -qm "token, never marked on this ref"
+    git switch -q main
+    git switch -q -c marked
+    printf 'TOKEN=ghp_%s  # pre-push: fixture\n' "${TOK_H}" > same.sh
+    git add same.sh
+    git commit -qm "token, marked on this ref"
+    rc="$(_rc git push -q origin marked unmarked 2>"${ROOT}/h4")"
+    _check "(c) a fixture marker does not exempt another ref" 1 "${rc}"
+
+    # (d) a copy of a secret-shaped path counts under both names
+    _setup_repo
+    printf 'k\nk\nk\n' > id_rsa
+    git add id_rsa
+    git commit -qm "publish a key name"
+    git push -q --no-verify origin main 2>/dev/null
+    git switch -q -c copy
+    cp id_rsa backup.txt
+    git add backup.txt
+    git commit -qm "copy the key to a harmless name"
+    rc="$(_rc git push -q origin copy 2>"${ROOT}/h5")"
+    _check "(d) copying a secret-shaped path to a harmless name blocks" 1 "${rc}"
+    _expect_output "(d) copy reported under both names" yes "id_rsa copied to backup.txt" "${ROOT}/h5"
+
+    # (e) git C-quotes a name with a control character or a double quote
+    # even with core.quotePath=false, and the closing quote hid the extension
+    _setup_repo
+    git push -q origin main 2>/dev/null
+    printf 'k\n' > $'esc\033[2Jname.pem'
+    git add -A
+    git commit -qm "control character in a key name"
+    rc="$(_rc git push -q origin main 2>"${ROOT}/h6")"
+    _check "(e) a path with a control character blocks" 1 "${rc}"
+    _expect_output "(e) the control character is not echoed raw" no $'\033' "${ROOT}/h6"
+    _setup_repo
+    git push -q origin main 2>/dev/null
+    printf 'k\n' > 'quo"te.pem'
+    git add -A
+    git commit -qm "double quote in a key name"
+    rc="$(_rc git push -q origin main 2>"${ROOT}/h7")"
+    _check "(e) a secret-shaped path with a double quote blocks" 1 "${rc}"
+
+    # (f) an unreadable stdin (here a directory, which read(2) refuses with
+    # EISDIR) is not an empty ref-update list
+    _setup_repo
+    rc="$(_rc bash "${HOOK}" origin "${ROOT}/remote.git" < / 2>"${ROOT}/h8")"
+    _check "(f) an unreadable stdin refuses the push" 1 "${rc}"
+
+    # (g) .env.<anything> is secret-shaped; .env.example and .env.sample are not
+    local ENV_NAME ENV_WANT
+    for ENV_NAME in .env.local:1 app/.env.production:1 .env.example:0 .env.sample:0; do
+        ENV_WANT="${ENV_NAME##*:}"
+        ENV_NAME="${ENV_NAME%:*}"
+        _setup_repo
+        git push -q origin main 2>/dev/null
+        mkdir -p "$(dirname "${ENV_NAME}")"
+        printf 'PORT=8080\n' > "${ENV_NAME}"
+        git add -f "${ENV_NAME}"
+        git commit -qm "add ${ENV_NAME}"
+        rc="$(_rc git push -q origin main 2>"${ROOT}/h9")"
+        _check "(g) ${ENV_NAME} rc=${ENV_WANT}" "${ENV_WANT}" "${rc}"
+    done
+
+    # (h) git-lfs runs when a PUSHED ref uses LFS, whatever the checkout holds
+    _setup_repo
+    git push -q origin main 2>/dev/null
+    mkdir -p "${ROOT}/fakebin"
+    printf '#!/bin/sh\ncat > /dev/null\n: > %q\n' "${ROOT}/lfs-called" > "${ROOT}/fakebin/git-lfs"
+    chmod +x "${ROOT}/fakebin/git-lfs"
+    rm -f "${ROOT}/lfs-called"
+    git switch -q -c lfs
+    printf '*.bin filter=lfs diff=lfs merge=lfs -text\n' > .gitattributes
+    git add .gitattributes
+    git commit -qm "track binaries in lfs"
+    git switch -q main
+    rc="$(_rc env GIT_CONFIG_GLOBAL=/dev/null PATH="${ROOT}/fakebin:${PATH}" git push -q origin lfs 2>"${ROOT}/h10")"
+    _check "(h) push of an LFS ref from a non-LFS checkout passes" 0 "${rc}"
+    if [[ -f "${ROOT}/lfs-called" ]]; then
+        printf '[pass] (h) git-lfs pre-push ran for the pushed LFS ref\n'
+        _PASS=$(( _PASS + 1 ))
+    else
+        printf '[fail] (h) git-lfs pre-push ran for the pushed LFS ref\n'
+        _FAIL=$(( _FAIL + 1 ))
+    fi
+
+    # (i) every GitHub token prefix in a URL userinfo, not only gho_ and ghp_
+    local PFX
+    for PFX in ghu_ ghs_ ghr_; do
+        rc="$(_rc bash "${HOOK}" leaky "https://${PFX}${TOK_H}@example.invalid/r.git" < /dev/null 2>"${ROOT}/h11")"
+        _check "(i) ${PFX} token in a URL userinfo blocks" 1 "${rc}"
+    done
+
+    # an added line that itself starts with "++" reads as "+++" in the diff,
+    # which the header filter dropped unscanned
+    _setup_repo
+    git push -q origin main 2>/dev/null
+    printf '++TOKEN=ghp_%s\n' "${TOK_H}" > plusplus.txt
+    git add plusplus.txt
+    git commit -qm "token on a line starting with two plus signs"
+    rc="$(_rc git push -q origin main 2>"${ROOT}/h12")"
+    _check "a token on a line starting with ++ blocks" 1 "${rc}"
+
+    # v1.18 (hook v1.20): the review findings on hook v1.18.
+    # an .env template name passes whatever its suffix order; a value file
+    # with a template-looking infix still blocks
+    for ENV_NAME in .env.dist:0 .env.template:0 .env.local.example:0 config/.env.example:0 \
+        .env.example.local:1; do
+        ENV_WANT="${ENV_NAME##*:}"
+        ENV_NAME="${ENV_NAME%:*}"
+        _setup_repo
+        git push -q origin main 2>/dev/null
+        mkdir -p "$(dirname "${ENV_NAME}")"
+        printf 'PORT=8080\n' > "${ENV_NAME}"
+        git add -f "${ENV_NAME}"
+        git commit -qm "add ${ENV_NAME}"
+        rc="$(_rc git push -q origin main 2>"${ROOT}/j1")"
+        _check "${ENV_NAME} rc=${ENV_WANT}" "${ENV_WANT}" "${rc}"
+    done
+
+    # past diff.renameLimit git skips exhaustive rename and copy detection
+    # with only a warning, and an edited key renamed to a harmless name then
+    # reads as a delete plus an unrelated add. with the limit at 1, two
+    # inexact renames in one commit are enough to make the warning fire.
+    _setup_repo
+    printf 'k\nk\nk\nk\nk\n' > id_rsa
+    printf 'o\no\no\no\no\n' > other.txt
+    git add id_rsa other.txt
+    git commit -qm "publish a key name"
+    git push -q --no-verify origin main 2>/dev/null
+    git config diff.renameLimit 1
+    git mv id_rsa backup.txt
+    printf 'k\n' >> backup.txt
+    git mv other.txt moved.txt
+    printf 'o\n' >> moved.txt
+    git add backup.txt moved.txt
+    git commit -qm "rename the key to a harmless name and edit it"
+    rc="$(_rc git push -q origin main 2>"${ROOT}/j2")"
+    _check "a skipped rename detection refuses the push" 1 "${rc}"
+    _expect_output "the refusal names the rename limit" yes "renameLimit" "${ROOT}/j2"
+
+    # the fixture path key must not depend on the user's diff prefixes
+    local PFX_CFG
+    for PFX_CFG in diff.dstPrefix=z/ diff.noprefix=true; do
+        _setup_repo
+        git push -q origin main 2>/dev/null
+        mkdir -p b
+        printf 'TOKEN=ghp_%s\n' "${TOK_H}" > b/fx.sh
+        git add b/fx.sh
+        git commit -qm "fixture, not yet marked"
+        printf 'TOKEN=ghp_%s  # pre-push: fixture\n' "${TOK_H}" > b/fx.sh
+        git add b/fx.sh
+        git commit -qm "mark the fixture"
+        rc="$(_rc git -c "${PFX_CFG}" push -q origin main 2>"${ROOT}/j3")"
+        _check "a fixture marked later still exempts under ${PFX_CFG}" 0 "${rc}"
+    done
 
     # a relative candidate reaches the hook, end to end: the suite runs again
     # with a relative PRE_PUSH_HOOK naming a copy of the hook that records
