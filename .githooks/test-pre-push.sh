@@ -5,12 +5,12 @@
 #
 # ---
 # name: test-pre-push
-# version: v1.18
+# version: v1.25
 # created: 2026-08-02
 # created_by: cl-bs
-# updated: 2026-10-01
+# updated: 2026-10-02
 # updated_by: cl-bs
-# description: regression suite for .githooks/pre-push; builds throwaway repos in a tempdir and asserts what the hook blocks and what it lets through. v1.3 adds coverage for the fixture marker's markdown form and the new-ref path base, merged from a parallel line into the v1.7 hook. v1.4 adds coverage for the eight v1.8 security fixes: basic-auth redaction (content scan and PII sweep), merge-commit scanning via first-parent diff, per-remote new-ref exclusion, the fixture marker's whole-line match, non-ASCII path scanning, the exact-path catalogue exclusion, content-aware already-published detection, and check-1 userinfo redaction with a slash. v1.5 adds coverage for the v1.9 already-published fix: a blob swapped to a real secret and back within one range still blocks, content recreated identical to the base blob still warns, a deletion-only range still warns, a new-ref blob matching a later-sorted remote branch still warns (not just the first-sorted one), and a new-ref blob matching no base still blocks. v1.6 adds coverage for the remaining v1.9 fixes that had none: a push target given as a bare URL redacts on every REMOTE_DISPLAY output line, not just the check-1 refusal; the PII sweep masks the full check-2 catalogue (not only URL userinfo) before re-reading ADDED content, so a token immediately followed by "@domain" is not printed twice; a remote name carrying a glob or pipe character is refused outright; redact_url() and the generic basic-auth URL pattern go greedy past a second userinfo "@" and accept an empty password; a fixture marker's trailing whitespace before the marker still exempts the line, in both comment and markdown form; and the fail-closed rev-list abort names `git fetch` when a --force push's remote sha is not yet in this clone. v1.9 merges the main line's suite (v1.7 to v1.8): check 3 on a PR forge with a parsed, case-folded host and trailing root dots, the long credential URL that outlasts the pipe buffer, a deletion that passes and an addition that still blocks, a rename to a harmless name that blocks, a quoted non-ASCII path and a file added in the merge commit itself. v1.10 adds the v2.0 lineage's case that main lacked: a fixture marker mid-line does not exempt the token after it. v1.12 resolves a relative PRE_PUSH_HOOK before the first cd. v1.13 covers that relative branch with a case of its own. v1.14 makes that case end to end: a nested run with a relative candidate that records its calls. v1.15 lets the literal secret-scan companion follow the marker and proves a token after the companion still blocks. v1.16 pins the hook v1.18 fixes: a basic-auth password with an "@", query-string and ghu_/ghs_/ghr_ URL credentials, fixture markers scoped to their file and ref, copy detection, control characters and double quotes in names, an unreadable stdin, .env.<suffix> files, git-lfs for a pushed LFS ref and a token on a line starting with "++". v1.17 drops internal host names from the comments. v1.18 pins the hook v1.20 fixes: .env template names with any suffix, a refused push when git skips rename detection, and fixture keys under a user diff prefix.
+# description: regression suite for the pre-push hook; proves in throwaway repositories that real pushes pass and planted secrets, secret-shaped names and leaky remotes are blocked
 # type: test
 # ---
 #
@@ -28,6 +28,66 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 #
+
+# version history (moved out of the description field in v1.20):
+# v1.3 adds coverage for the fixture marker's markdown form and the new-ref
+# path base, merged from a parallel line into the v1.7 hook. v1.4 adds
+# coverage for the eight v1.8 security fixes: basic-auth redaction (content
+# scan and PII sweep), merge-commit scanning via first-parent diff,
+# per-remote new-ref exclusion, the fixture marker's whole-line match,
+# non-ASCII path scanning, the exact-path catalogue exclusion, content-aware
+# already-published detection, and check-1 userinfo redaction with a slash.
+# v1.5 adds coverage for the v1.9 already-published fix: a blob swapped to a
+# real secret and back within one range still blocks, content recreated
+# identical to the base blob still warns, a deletion-only range still warns,
+# a new-ref blob matching a later-sorted remote branch still warns (not just
+# the first-sorted one), and a new-ref blob matching no base still blocks.
+# v1.6 adds coverage for the remaining v1.9 fixes that had none: a push
+# target given as a bare URL redacts on every REMOTE_DISPLAY output line,
+# not just the check-1 refusal; the PII sweep masks the full check-2
+# catalogue (not only URL userinfo) before re-reading ADDED content, so a
+# token immediately followed by "@domain" is not printed twice; a remote
+# name carrying a glob or pipe character is refused outright; redact_url()
+# and the generic basic-auth URL pattern go greedy past a second userinfo
+# "@" and accept an empty password; a fixture marker's trailing whitespace
+# before the marker still exempts the line, in both comment and markdown
+# form; and the fail-closed rev-list abort names `git fetch` when a --force
+# push's remote sha is not yet in this clone. v1.9 merges the main line's
+# suite (v1.7 to v1.8): check 3 on a PR forge with a parsed, case-folded
+# host and trailing root dots, the long credential URL that outlasts the
+# pipe buffer, a deletion that passes and an addition that still blocks, a
+# rename to a harmless name that blocks, a quoted non-ASCII path and a file
+# added in the merge commit itself. v1.10 adds the v2.0 lineage's case that
+# main lacked: a fixture marker mid-line does not exempt the token after it.
+# v1.12 resolves a relative PRE_PUSH_HOOK before the first cd. v1.13 covers
+# that relative branch with a case of its own. v1.14 makes that case end to
+# end: a nested run with a relative candidate that records its calls. v1.15
+# lets the literal secret-scan companion follow the marker and proves a
+# token after the companion still blocks. v1.16 pins the hook v1.18 fixes: a
+# basic-auth password with an "@", query-string and ghu_/ghs_/ghr_ URL
+# credentials, fixture markers scoped to their file and ref, copy detection,
+# control characters and double quotes in names, an unreadable stdin,
+# .env.<suffix> files, git-lfs for a pushed LFS ref and a token on a line
+# starting with "++". v1.17 drops internal host names from the comments.
+# v1.18 pins the hook v1.20 fixes: .env template names with any suffix, a
+# refused push when git skips rename detection, and fixture keys under a
+# user diff prefix. v1.19 pins that a fixture marker exempts a line, at the
+# tip too, only when it ends the line as a word of its own (pre-push v1.21).
+# v1.20 moves this history out of the description field. v1.22 pins the
+# hook v1.23 fixes: an LFS push refused without git-lfs, LFS use inside the
+# range, a line with two fixture markers, .env templates inside a store,
+# the deletion of a name with a control character, and a secret on a side
+# branch that a `merge -s ours` made TREESAME (fails without --full-history
+# and without --diff-merges, which on git 2.53 also disables the pruning).
+# v1.23 pins hook v1.24 and the second review of hook v1.23: a --no-ff merge
+# of a .gitattributes without LFS, a commented lfs line, and a token line or
+# a secret-shaped name with an invalid UTF-8 byte under a UTF-8 locale.
+# v1.24 pins hook v1.25: filter=lfs as an attribute token (a `#` inside a
+# pattern, myfilter=lfs, filter=lfs2), an uncapped .gitattributes walk, a
+# push that only drops LFS, and a failed parent lookup; the PATH without
+# git-lfs links the running bash and the hook's tools by resolved path.
+# v1.25 pins hook v1.26: a commit that drops LFS and adds a file, linear,
+# as a --no-ff side branch and as a new branch.
 
 # a guard that blocks a legitimate push is worse than no guard, so the
 # suite asserts BOTH directions: real pushes stay allowed, planted
@@ -129,6 +189,24 @@ _rc() {
     printf '%s' "${rc}"
 }
 
+# the tip-side exemption on its own: publish a marked line with --no-verify,
+# then push a commit that adds the same line unmarked beside it. the scan of
+# the new commit sees only the unmarked copy, so tip_fixtures() alone decides
+# the outcome; the marked line's own arrival cannot isolate it, because that
+# line carries the token and blocks by itself.
+_tip_marker_case() {
+    local name="${1}" want="${2}" marked="${3}" bare="${4}" rc
+    _setup_repo
+    printf '%s\n' "${marked}" > tip.sh
+    git add tip.sh
+    git commit -qm "seed a marked line"
+    git push -q --no-verify origin main 2>/dev/null
+    printf '%s\n' "${bare}" >> tip.sh
+    git commit -qam "add the same line unmarked"
+    rc="$(_rc git push -q origin main 2>"${ROOT}/o-tip")"
+    _check "${name}" "${want}" "${rc}"
+}
+
 main() {
     local rc
 
@@ -226,6 +304,17 @@ main() {
     rc="$(_rc git push -q origin main 2>"${ROOT}/o6")"
     _check "personal identifiers allowed" 0 "${rc}"
     _expect_output "personal identifiers warned" yes "personal identifier" "${ROOT}/o6"
+
+    # a Python decorator on an added line reads "+@functools.lru_cache" in the
+    # diff and matched the address pattern on every push (2026-10-01)
+    _setup_repo
+    git push -q origin main 2>/dev/null
+    printf '@functools.lru_cache(maxsize=1)\ndef f():\n    return 1\n' > deco.py
+    git add deco.py
+    git commit -qm "decorator"
+    rc="$(_rc git push -q origin main 2>"${ROOT}/o6d")"
+    _check "decorator push allowed" 0 "${rc}"
+    _expect_output "a decorator is no address" no "personal identifier" "${ROOT}/o6d"
 
     # a deletion publishes nothing and must not error
     _setup_repo
@@ -932,6 +1021,31 @@ main() {
     rc="$(_rc git push -q origin main 2>"${ROOT}/o66d")"
     _check "a token after the companion marker still blocks" 1 "${rc}"
 
+    # the fixture contract (pre-push, above tip_fixtures) lets only
+    # whitespace, a comment closer or the secret-scan companion follow the
+    # marker. tip_fixtures() stripped "marker.*$" from any line containing
+    # the marker, so text after it, or a marker inside a longer word, still
+    # turned the line's prefix into an exemption (copilot review, 2026-10-01).
+    TOK_T="$(printf 'T%.0s' {1..36})"
+    _tip_marker_case "tip: a marker at the end of the line exempts its unmarked copy" 0 \
+        "TOKEN=ghp_${TOK_T}  # pre-push: fixture" "TOKEN=ghp_${TOK_T}"
+    _tip_marker_case "tip: a marker followed by more text exempts nothing" 1 \
+        "TOKEN=ghp_${TOK_T}  # pre-push: fixture and then ghp_${TOK_T}" "TOKEN=ghp_${TOK_T}"
+    _tip_marker_case "tip: a marker inside a longer word exempts nothing" 1 \
+        "TOKEN=ghp_${TOK_T}  # pre-push: fixtures" "TOKEN=ghp_${TOK_T}"
+    _tip_marker_case "tip: a word glued before the marker exempts nothing" 1 \
+        "TOKEN=ghp_${TOK_T}  # notpre-push: fixture" "TOKEN=ghp_${TOK_T}"
+
+    # the glued word on the line's own arrival: the end-of-line filter of the
+    # range scan anchored only the end of the marker.
+    _setup_repo
+    git push -q origin main 2>/dev/null
+    printf 'TOKEN=ghp_%s  # notpre-push: fixture\n' "${TOK_T}" > glued.sh
+    git add glued.sh
+    git commit -qm "marker glued to a word before it"
+    rc="$(_rc git push -q origin main 2>"${ROOT}/o66e")"
+    _check "a word glued before the marker does not exempt the line" 1 "${rc}"
+
     # same shape, never marked: the trim must not become a global weakening
     # that exempts any token with trailing whitespace.
     _setup_repo
@@ -1151,6 +1265,275 @@ main() {
         _check "a fixture marked later still exempts under ${PFX_CFG}" 0 "${rc}"
     done
 
+    # v1.22 (hook v1.23): the review findings on hook v1.21.
+    # a PATH without git-lfs: every other tool in /usr/bin stays reachable,
+    # so only the missing git-lfs can change the outcome
+    mkdir -p "${ROOT}/nolfs-bin"
+    ln -s /usr/bin/* "${ROOT}/nolfs-bin/"
+    # git, the bash this suite runs with, and every tool the hook calls may
+    # live elsewhere (/usr/local/bin, a Homebrew prefix): link each by the
+    # path this shell resolves (v1.24)
+    local NOLFS_TOOL
+    for NOLFS_TOOL in git env awk basename cat cut grep head mktemp rm sed sort tr; do
+        ln -sf "$(command -v "${NOLFS_TOOL}")" "${ROOT}/nolfs-bin/${NOLFS_TOOL}"
+    done
+    ln -sf "${BASH}" "${ROOT}/nolfs-bin/bash"
+    rm -f "${ROOT}/nolfs-bin/git-lfs"
+
+    # a pushed LFS ref with git-lfs missing published pointers to objects the
+    # remote never received, and the hook passed
+    _setup_repo
+    git push -q origin main 2>/dev/null
+    git switch -q -c lfs-missing
+    printf '*.bin filter=lfs diff=lfs merge=lfs -text\n' > .gitattributes
+    git add .gitattributes
+    git commit -qm "track binaries in lfs"
+    rc="$(_rc env GIT_CONFIG_GLOBAL=/dev/null PATH="${ROOT}/nolfs-bin" git push -q origin lfs-missing 2>"${ROOT}/k1")"
+    _check "an LFS push without git-lfs is refused" 1 "${rc}"
+    _expect_output "the refusal names git-lfs" yes "git-lfs is not installed" "${ROOT}/k1"
+    git switch -q main
+    printf 'more\n' >> readme.md
+    git commit -qam "no lfs here"
+    rc="$(_rc env GIT_CONFIG_GLOBAL=/dev/null PATH="${ROOT}/nolfs-bin" git push -q origin main 2>"${ROOT}/k2")"
+    _check "a push without LFS passes without git-lfs" 0 "${rc}"
+
+    # LFS used inside the range and dropped at the tip still needs the upload:
+    # the pointers sit in the published commits
+    _setup_repo
+    git push -q origin main 2>/dev/null
+    rm -f "${ROOT}/lfs-called"
+    printf '*.bin filter=lfs diff=lfs merge=lfs -text\n' > .gitattributes
+    git add .gitattributes
+    git commit -qm "track binaries in lfs"
+    git rm -q .gitattributes
+    git commit -qm "stop tracking binaries in lfs"
+    rc="$(_rc env GIT_CONFIG_GLOBAL=/dev/null PATH="${ROOT}/fakebin:${PATH}" git push -q origin main 2>"${ROOT}/k3")"
+    _check "a range that used LFS before its tip passes" 0 "${rc}"
+    if [[ -f "${ROOT}/lfs-called" ]]; then
+        printf '[pass] git-lfs pre-push ran for LFS use inside the range\n'
+        _PASS=$(( _PASS + 1 ))
+    else
+        printf '[fail] git-lfs pre-push ran for LFS use inside the range\n'
+        _FAIL=$(( _FAIL + 1 ))
+    fi
+
+    # a line with two markers: the strip cut at the FIRST one, so its prefix
+    # exempted a shorter unmarked line
+    _tip_marker_case "tip: a second marker does not exempt the text before the first" 1 \
+        "TOKEN=ghp_${TOK_T}  # pre-push: fixture x  # pre-push: fixture" "TOKEN=ghp_${TOK_T}"
+
+    # the .env template allowance must not reach into a restricted store
+    for ENV_NAME in .ssh/.env.example .gnupg/.env.sample; do
+        _setup_repo
+        git push -q origin main 2>/dev/null
+        mkdir -p "$(dirname "${ENV_NAME}")"
+        printf 'PORT=8080\n' > "${ENV_NAME}"
+        git add -f "${ENV_NAME}"
+        git commit -qm "add ${ENV_NAME}"
+        rc="$(_rc git push -q origin main 2>"${ROOT}/k4")"
+        _check "a template name inside a store blocks: ${ENV_NAME}" 1 "${rc}"
+    done
+
+    # deleting a file whose name carries a control character removes the risk
+    _setup_repo
+    printf 'k\n' > $'esc\033[2Jname.txt'
+    git add -A
+    git commit -qm "control character in a name"
+    git push -q --no-verify origin main 2>/dev/null
+    git rm -q -- $'esc\033[2Jname.txt'
+    git commit -qm "delete it"
+    rc="$(_rc git push -q origin main 2>"${ROOT}/k5")"
+    _check "deleting a path with a control character passes" 0 "${rc}"
+
+    # a merge that keeps main's side (-s ours) is TREESAME to its first parent,
+    # and a path-limited git log without --full-history then prunes every
+    # commit of the side branch, although the push publishes them all
+    _setup_repo
+    printf 'not actually a key, v1\n' > key.pem
+    git add key.pem
+    git commit -qm "publish a key name"
+    git push -q --no-verify origin main 2>/dev/null
+    git switch -q -c side
+    printf 'not actually a key, v2\n' > key.pem
+    git commit -qam "new key content on a side branch"
+    git switch -q main
+    git merge -q -s ours --no-edit side
+    rc="$(_rc git push -q origin main 2>"${ROOT}/k6")"
+    _check "new content of a known path on a merged-away side branch blocks" 1 "${rc}"
+    _expect_output "that path reported as newly published" yes "newly published" "${ROOT}/k6"
+
+    _setup_repo
+    git push -q origin main 2>/dev/null
+    git switch -q -c side
+    printf 'TOKEN=ghp_%s\n' "${TOK_H}" > side-leak.txt
+    git add side-leak.txt
+    git commit -qm "token on a side branch"
+    git switch -q main
+    git merge -q -s ours --no-edit side
+    rc="$(_rc git push -q origin main 2>"${ROOT}/k7")"
+    _check "a token on a merged-away side branch blocks" 1 "${rc}"
+
+    # v1.23 (hook v1.24): the second review of hook v1.23.
+    # a --no-ff merge that touches .gitattributes without LFS: the merge's
+    # patch lines reached uses_lfs() as commit names, and the error counted
+    # as LFS use, so the push was refused without git-lfs
+    _setup_repo
+    git push -q origin main 2>/dev/null
+    git switch -q -c side
+    printf '*.txt text\n' > .gitattributes
+    git add .gitattributes
+    git commit -qm "attributes without lfs"
+    git switch -q main
+    git merge -q --no-ff --no-edit side
+    rc="$(_rc env GIT_CONFIG_GLOBAL=/dev/null PATH="${ROOT}/nolfs-bin" git push -q origin main 2>"${ROOT}/m1")"
+    _check "a --no-ff merge of .gitattributes without lfs passes without git-lfs" 0 "${rc}"
+
+    # LFS that a --no-ff merge brought in and a later commit dropped still
+    # refuses without git-lfs
+    _setup_repo
+    git push -q origin main 2>/dev/null
+    git switch -q -c side
+    printf '*.bin filter=lfs diff=lfs merge=lfs -text\n' > .gitattributes
+    git add .gitattributes
+    git commit -qm "track binaries in lfs"
+    git switch -q main
+    git merge -q --no-ff --no-edit side
+    git rm -q .gitattributes
+    git commit -qm "stop tracking binaries in lfs"
+    rc="$(_rc env GIT_CONFIG_GLOBAL=/dev/null PATH="${ROOT}/nolfs-bin" git push -q origin main 2>"${ROOT}/m2")"
+    _check "lfs merged in --no-ff and dropped still refuses without git-lfs" 1 "${rc}"
+
+    # a commented-out lfs line is no LFS use
+    _setup_repo
+    git push -q origin main 2>/dev/null
+    printf '# *.bin filter=lfs diff=lfs merge=lfs -text\n' > .gitattributes
+    git add .gitattributes
+    git commit -qm "lfs line commented out"
+    rc="$(_rc env GIT_CONFIG_GLOBAL=/dev/null PATH="${ROOT}/nolfs-bin" git push -q origin main 2>"${ROOT}/m3")"
+    _check "a commented lfs line passes without git-lfs" 0 "${rc}"
+
+    # an invalid UTF-8 byte: GNU grep under a UTF-8 locale treats the input as
+    # binary and drops the line from its output, so the line passed unscanned.
+    # the push runs under C.UTF-8 so the case holds whatever the caller's locale.
+    _setup_repo
+    git push -q origin main 2>/dev/null
+    printf 'TOKEN=ghp_%s \377\n' "${TOK_H}" > latin1.txt
+    git add latin1.txt
+    git commit -qm "token on a line with an invalid utf-8 byte"
+    rc="$(_rc env LC_ALL=C.UTF-8 git push -q origin main 2>"${ROOT}/m4")"
+    _check "a token on a line with an invalid utf-8 byte blocks" 1 "${rc}"
+    local BAD_NAME
+    for BAD_NAME in $'.ssh/k\377' $'k\377.pem'; do
+        _setup_repo
+        git push -q origin main 2>/dev/null
+        mkdir -p "$(dirname "${BAD_NAME}")"
+        printf 'k\n' > "${BAD_NAME}"
+        git add -f -- "${BAD_NAME}"
+        git commit -qm "secret-shaped name with an invalid utf-8 byte"
+        rc="$(_rc env LC_ALL=C.UTF-8 git push -q origin main 2>"${ROOT}/m5")"
+        _check "a secret-shaped name with an invalid utf-8 byte blocks: ${BAD_NAME//$'\377'/?}" 1 "${rc}"
+    done
+
+    # v1.24 (hook v1.25): the third review of the LFS check.
+    # filter=lfs counts as an attribute token only: a `#` inside a pattern is
+    # no comment, and myfilter=lfs or filter=lfs2 is no LFS use
+    local ATTR_LINE
+    for ATTR_LINE in '*.bin myfilter=lfs' '*.bin filter=lfs2' '   # *.bin filter=lfs'; do
+        _setup_repo
+        git push -q origin main 2>/dev/null
+        printf '%s\n' "${ATTR_LINE}" > .gitattributes
+        git add .gitattributes
+        git commit -qm "attributes that are no lfs use"
+        rc="$(_rc env GIT_CONFIG_GLOBAL=/dev/null PATH="${ROOT}/nolfs-bin" git push -q origin main 2>"${ROOT}/n1")"
+        _check "no lfs use passes without git-lfs: ${ATTR_LINE}" 0 "${rc}"
+    done
+    _setup_repo
+    git push -q origin main 2>/dev/null
+    printf 'a#b.bin filter=lfs diff=lfs merge=lfs -text\n' > .gitattributes
+    git add .gitattributes
+    git commit -qm "lfs for a pattern with a hash"
+    rc="$(_rc env GIT_CONFIG_GLOBAL=/dev/null PATH="${ROOT}/nolfs-bin" git push -q origin main 2>"${ROOT}/n2")"
+    _check "lfs on a pattern containing # refuses without git-lfs" 1 "${rc}"
+
+    # a push that only removes the LFS attributes uploads no LFS object: the
+    # parent outside the range is no part of the push. the base goes up with
+    # the fake git-lfs on PATH.
+    _setup_repo
+    printf '*.bin filter=lfs diff=lfs merge=lfs -text\n' > .gitattributes
+    git add .gitattributes
+    git commit -qm "track binaries in lfs"
+    env GIT_CONFIG_GLOBAL=/dev/null PATH="${ROOT}/fakebin:${PATH}" git push -q origin main 2>/dev/null
+    git rm -q .gitattributes
+    git commit -qm "stop tracking binaries in lfs"
+    rc="$(_rc env GIT_CONFIG_GLOBAL=/dev/null PATH="${ROOT}/nolfs-bin" git push -q origin main 2>"${ROOT}/n3")"
+    _check "a push that only drops lfs passes without git-lfs" 0 "${rc}"
+
+    # a commit that drops the LFS attributes AND adds a file still pushes an
+    # LFS pointer under the published parent's attributes: linear, as a
+    # --no-ff side branch, and as a new branch (review of hook v1.25)
+    local LFS_SHAPE
+    for LFS_SHAPE in linear no-ff new-branch; do
+        _setup_repo
+        printf '*.bin filter=lfs diff=lfs merge=lfs -text\n' > .gitattributes
+        git add .gitattributes
+        git commit -qm "track binaries in lfs"
+        env GIT_CONFIG_GLOBAL=/dev/null PATH="${ROOT}/fakebin:${PATH}" git push -q origin main 2>/dev/null
+        if [[ "${LFS_SHAPE}" != "linear" ]]; then
+            git switch -q -c side
+        fi
+        git rm -q .gitattributes
+        printf 'version https://git-lfs.github.com/spec/v1\n' > a.bin
+        git add a.bin
+        git commit -qm "drop lfs and add a pointer"
+        if [[ "${LFS_SHAPE}" == "no-ff" ]]; then
+            git switch -q main
+            git merge -q --no-ff --no-edit side
+        fi
+        local PUSH_REF="main"
+        if [[ "${LFS_SHAPE}" == "new-branch" ]]; then
+            PUSH_REF="side"
+        fi
+        rc="$(_rc env GIT_CONFIG_GLOBAL=/dev/null PATH="${ROOT}/nolfs-bin" git push -q origin "${PUSH_REF}" 2>"${ROOT}/n6")"
+        _check "dropping lfs while adding a file refuses without git-lfs: ${LFS_SHAPE}" 1 "${rc}"
+    done
+
+    # the .gitattributes walk is not capped at MAX_COMMITS: lfs in the oldest
+    # of 1002 attribute changes still refuses without git-lfs
+    _setup_repo
+    git push -q origin main 2>/dev/null
+    local BASE_SHA I ATTR_BODY
+    BASE_SHA="$(git rev-parse HEAD)"
+    {
+        for (( I = 1; I <= 1002; I++ )); do
+            ATTR_BODY="*.t${I} text"
+            if (( I == 1 )); then ATTR_BODY='*.bin filter=lfs diff=lfs merge=lfs -text'; fi
+            printf 'commit refs/heads/main\ncommitter t <t@example.invalid> %d +0000\ndata 7\nattr %02d\n' "$(( 1700000000 + I ))" "$(( I % 100 ))"
+            if (( I == 1 )); then printf 'from %s\n' "${BASE_SHA}"; fi
+            printf 'M 100644 inline .gitattributes\ndata %d\n%s\n\n' "$(( ${#ATTR_BODY} + 1 ))" "${ATTR_BODY}"
+        done
+    } | git fast-import --quiet --force
+    git reset -q --hard main
+    rc="$(_rc env GIT_CONFIG_GLOBAL=/dev/null PATH="${ROOT}/nolfs-bin" git push -q origin main 2>"${ROOT}/n4")"
+    _check "lfs beyond MAX_COMMITS attribute changes refuses without git-lfs" 1 "${rc}"
+
+    # a failed parent lookup refuses the push; an empty list failed open.
+    # git puts its exec-path first on the hook's PATH, so a wrapper earlier
+    # on PATH never runs; the wrapper replaces git in a copy of the exec-path
+    mkdir -p "${ROOT}/badparent-exec"
+    ln -s "$(git --exec-path)"/* "${ROOT}/badparent-exec/"
+    rm -f "${ROOT}/badparent-exec/git"
+    printf '#!/bin/sh\nif [ "$1" = rev-parse ]; then case "$2" in *^@) exit 128 ;; esac; fi\nexec %q "$@"\n' \
+        "$(command -v git)" > "${ROOT}/badparent-exec/git"
+    chmod +x "${ROOT}/badparent-exec/git"
+    _setup_repo
+    git push -q origin main 2>/dev/null
+    printf '*.txt text\n' > .gitattributes
+    git add .gitattributes
+    git commit -qm "attributes without lfs"
+    rc="$(_rc env GIT_CONFIG_GLOBAL=/dev/null GIT_EXEC_PATH="${ROOT}/badparent-exec" PATH="${ROOT}/nolfs-bin" git push -q origin main 2>"${ROOT}/n5")"
+    _check "a failed parent lookup refuses the push" 1 "${rc}"
+    _expect_output "the refusal names the parent lookup" yes "parents" "${ROOT}/n5"
+
     # a relative candidate reaches the hook, end to end: the suite runs again
     # with a relative PRE_PUSH_HOOK naming a copy of the hook that records
     # each call, and must pass with the record present. a bare run and make
@@ -1174,6 +1557,38 @@ main() {
             _FAIL=$(( _FAIL + 1 ))
         fi
     fi
+
+    # v1.25 check 4: a history rewrite of a protected ref, judged by value
+    # on a non-forge remote, so check 3 stays out of the way. each refusal
+    # has an allowed twin.
+    _setup_repo
+    local z c1 c2 c3
+    z="0000000000000000000000000000000000000000"
+    c1="$(git rev-parse HEAD)"
+    git commit -q --allow-empty -m c2
+    c2="$(git rev-parse HEAD)"
+    git checkout -q -b side "${c1}"
+    git commit -q --allow-empty -m c3
+    c3="$(git rev-parse HEAD)"
+    rw() { _rc bash "${HOOK}" origin "${ROOT}/remote.git" <<< "${1}" 2>"${ROOT}/rw"; }
+    _check "rewrite: fast-forward on main passes" 0 "$(rw "refs/heads/main ${c2} refs/heads/main ${c1}")"
+    _check "rewrite: non-fast-forward on main refused" 1 "$(rw "refs/heads/main ${c3} refs/heads/main ${c2}")"
+    _expect_output "rewrite: the refusal names the override" yes "ALLOW_REWRITE=1" "${ROOT}/rw"
+    rc="$(ALLOW_REWRITE=1 _rc bash "${HOOK}" origin "${ROOT}/remote.git" \
+        <<< "refs/heads/main ${c3} refs/heads/main ${c2}" 2>"${ROOT}/rw")"
+    _check "rewrite: ALLOW_REWRITE=1 lets it through" 0 "${rc}"
+    _check "rewrite: non-fast-forward on develop refused" 1 "$(rw "refs/heads/develop ${c3} refs/heads/develop ${c2}")"
+    _check "rewrite: non-fast-forward on master refused" 1 "$(rw "refs/heads/master ${c3} refs/heads/master ${c2}")"
+    _check "rewrite: non-fast-forward on a work branch passes" 0 "$(rw "refs/heads/wip/x ${c3} refs/heads/wip/x ${c2}")"
+    _check "rewrite: deleting main refused" 1 "$(rw "(delete) ${z} refs/heads/main ${c2}")"
+    _check "rewrite: deleting a work branch passes" 0 "$(rw "(delete) ${z} refs/heads/wip/x ${c2}")"
+    _check "rewrite: creating a tag passes" 0 "$(rw "refs/tags/v1 ${c1} refs/tags/v1 ${z}")"
+    _check "rewrite: moving a tag refused" 1 "$(rw "refs/tags/v1 ${c2} refs/tags/v1 ${c1}")"
+    _check "rewrite: deleting a tag refused" 1 "$(rw "(delete) ${z} refs/tags/v1 ${c1}")"
+    _check "rewrite: an unknown remote tip on main refused" 1 \
+        "$(rw "refs/heads/main ${c2} refs/heads/main 1111111111111111111111111111111111111111")"
+    _expect_output "rewrite: the unknown tip is refused as unverifiable" yes "fetch the remote" "${ROOT}/rw"
+    git checkout -q main
 
     printf '\n[info] %d passed, %d failed\n' "${_PASS}" "${_FAIL}"
     [[ "${_FAIL}" -eq 0 ]]

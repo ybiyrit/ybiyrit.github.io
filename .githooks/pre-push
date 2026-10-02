@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # shellcheck shell=bash
-# pre-push hook v1.20 created 2605 cl-bs updated 2610 cl-bs
+# pre-push hook v1.26 created 2605 cl-bs updated 2610 cl-bs
 #
 # universal pre-push guard. three independent checks, all fail closed:
 #
@@ -59,6 +59,43 @@
 # `git push '*' ref`) either widened the `--glob=refs/remotes/NAME/*`
 # exclusion past that one remote or broke the `|`-packed range split.
 #
+# v1.26 (2026-10-02) reads a published parent again when the commit also
+# changes a path other than .gitattributes: v1.25 skipped it for every
+# commit, so a commit that dropped filter=lfs and added a pointer under the
+# parent's attributes passed without git-lfs.
+#
+# v1.25 (2026-10-02) also adds check 4, landed in parallel as b5b5ff02:
+# a history rewrite of a protected ref is refused (ALLOW_REWRITE=1 once).
+#
+# v1.25 (2026-10-02) closes a third review of the LFS check: filter=lfs
+# counted anywhere after a `#` was ruled out, though .gitattributes reads
+# `#` as a comment only at the start of a line, and inside a longer word
+# (myfilter=lfs, filter=lfs2); the .gitattributes walk shared the content
+# cap, so LFS older than the newest 1000 attribute changes passed; a parent
+# outside the range was read, so a push that only drops LFS was refused
+# without git-lfs; and a failed parent lookup read as "no parents".
+#
+# v1.24 (2026-10-01) runs in the C locale. GNU grep 3.12 under a UTF-8
+# locale reads a line with an invalid UTF-8 byte as binary, prints "binary
+# file matches" instead of the line and exits 0, so a token line carrying
+# one Latin-1 byte, and the names .ssh/k<0xff> and k<0xff>.pem, passed.
+#
+# v1.23 (2026-10-01) closes a review of v1.21: a push that used LFS passed
+# when git-lfs was missing, and git-lfs was skipped when a commit inside the
+# range, not the tip, carried filter=lfs; a line with two fixture markers
+# exempted the text before the first; the .env template allowance reached
+# into the restricted stores (.ssh/.env.example passed); the
+# control-character check refused the deletion that removes such a name;
+# and the path-limited walks now state --full-history, so a side branch a
+# merge made TREESAME stays in the scan whatever --diff-merges implies. a
+# second review: the commit-list walks print a merge's patch without
+# --no-patch, so a --no-ff merge of a .gitattributes without LFS was refused
+# when git-lfs was missing; a commented lfs line counted as LFS use; and
+# secret_paths() runs once per range over every renamed or copied source,
+# not once per record.
+#
+# v1.22 (2026-10-01) stops the PII sweep reading a decorator as an address.
+#
 # v1.20 (2026-10-01) closes a review of v1.18: .env template names with
 # another suffix (.env.dist, .env.template, .env.local.example) were refused;
 # a rename or copy detection that git skipped past diff.renameLimit passed
@@ -114,6 +151,9 @@
 #   3. default branch: refuse a direct push to main, master or the remote's
 #      recorded default branch when the remote is a PR forge (github.com).
 #      ALLOW_PUSH_TO_MAIN=1 overrides once, deliberately.
+#   4. history: refuse a non-fast-forward update, a deletion or a tag move
+#      of main, master, develop or any tag, on every remote.
+#      ALLOW_REWRITE=1 overrides once, deliberately.
 #
 # one repository holds the master of this file, and every other copy is a
 # mirror: a sync step copies the master into every discovered repo's
@@ -134,6 +174,12 @@
 #          that trust honest; this hook cannot detect staleness on its own.)
 set -o errexit -o nounset -o pipefail -o errtrace
 IFS=$'\n\t'
+# bytes, not characters, for every grep, sed, awk and tr below: a line with
+# an invalid UTF-8 byte must stay a line (v1.24, see the header). exported,
+# so git prints its warnings untranslated as well. cost: [[:alnum:]] is ASCII
+# only, so a non-ASCII letter directly before the fixture marker reads as a
+# word boundary.
+export LC_ALL=C
 
 # newest commits scanned per ref update. a first push to an empty remote
 # would otherwise walk the entire history.
@@ -449,6 +495,17 @@ readonly SCAN_EXCLUDE_PATHS_PLAIN
 # past id_rsa or a .pem path. Deliberately not a path or file allowlist: a
 # whole exempt file would stop being scanned the day it grows a real secret.
 readonly FIXTURE_MARKER='pre-push: fixture'
+# a marked line: the marker as a word of its own (no letter, digit or "_"
+# glued before it) that ends the line, see the fixture contract above
+# tip_fixtures(). both the range scan and tip_fixtures() test this one
+# pattern; until v1.21 tip_fixtures() took any line CONTAINING the marker,
+# so `<line> # pre-push: fixture, and more` or `# pre-push: fixtures` at
+# the tip still exempted an earlier unmarked copy of <line>.
+# FIXTURE_TAIL_RE is the final marker and what may follow it, the span
+# tip_fixtures() strips. a strip of "marker.*$" (v1.21) cut at the FIRST
+# marker, so `<a> # pre-push: fixture <b> # pre-push: fixture` exempted <a>.
+readonly FIXTURE_TAIL_RE="${FIXTURE_MARKER}(,?[[:space:]]*secret-scan:allow)?[[:space:]]*(-->)?[[:space:]]*\$"
+readonly FIXTURE_LINE_RE="(^|[^[:alnum:]_])${FIXTURE_TAIL_RE}"
 
 # secret-shaped FILENAMES and restricted stores. a file whose name says
 # "private key" is a leak regardless of what the content scan makes of it.
@@ -458,12 +515,29 @@ readonly FIXTURE_MARKER='pre-push: fixture'
 # sits between: .env.example, .env.dist, .env.local.example. v1.18 allowed
 # only .env.example and .env.sample and refused the other templates that
 # v1.17 had passed.
-readonly SECRET_PATH_PATTERN='(^|/)(id_rsa|id_ed25519|id_ecdsa|\.netrc|credentials\.json)$|\.(pem|key|p12|pfx|jks|keystore|kdbx|ovpn|token)$|(^|/)\.(env|secret)$|(^|/)\.env\.[^/]+$|\.secret$|(^|/)(ssh|\.ssh|\.password-store|\.gnupg|\.gpg|\.cert|\.pki|\.dat)/|(ssh|gpg|git)\.zip$'
+#
+# the template allowance covers a name, never a store: until v1.23 it was
+# subtracted from every match, so .ssh/.env.example and .gnupg/.env.sample
+# passed. secret_paths() applies the allowance, then adds back every path
+# under a restricted store.
+readonly SECRET_STORE_PATTERN='(^|/)(ssh|\.ssh|\.password-store|\.gnupg|\.gpg|\.cert|\.pki|\.dat)/'
+readonly SECRET_PATH_PATTERN='(^|/)(id_rsa|id_ed25519|id_ecdsa|\.netrc|credentials\.json)$|\.(pem|key|p12|pfx|jks|keystore|kdbx|ovpn|token)$|(^|/)\.(env|secret)$|(^|/)\.env\.[^/]+$|\.secret$|'"${SECRET_STORE_PATTERN}"'|(ssh|gpg|git)\.zip$'
 readonly SECRET_PATH_ALLOW_PATTERN='(^|/)\.env(\.[^/]+)?\.(example|sample|template|dist)$'
+
+# the secret-shaped paths in the newline-separated list $1, sorted, one each
+secret_paths() {
+    {
+        printf '%s\n' "${1}" | grep -E -- "${SECRET_PATH_PATTERN}" \
+            | grep -vE -- "${SECRET_PATH_ALLOW_PATTERN}" || true
+        printf '%s\n' "${1}" | grep -E -- "${SECRET_STORE_PATTERN}" || true
+    } | sort -u
+}
 
 # personal identifiers. ADVISORY: reported, never blocking.
 PII_PATTERNS=(
-    '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}'
+    # the local part starts with a letter or digit: a diff's '+' before a Python
+    # decorator (+@functools.lru_cache) matched on every push (2026-10-01)
+    '[A-Za-z0-9][A-Za-z0-9._%+-]*@[A-Za-z0-9.-]+\.[A-Za-z]{2,}'
     '\+49[0-9 /-]{8,}'
     '\b(10|192\.168|172\.(1[6-9]|2[0-9]|3[01]))\.[0-9]{1,3}\.[0-9]{1,3}\b'
 )
@@ -525,6 +599,50 @@ if [[ "${ALLOW_PUSH_TO_MAIN:-0}" != "1" && ( "${REMOTE_HOST}" == "github.com" ||
             printf '[info]   git switch -c <branch> && git push -u %s <branch>\n' "${REMOTE_DISPLAY}" >&2
             printf '[info]   gh pr create --base %s\n' "${R_REF#refs/heads/}" >&2
             printf '[info] override once, deliberately: ALLOW_PUSH_TO_MAIN=1 git push ...\n' >&2
+            exit 1
+        fi
+    done <<< "${REF_UPDATES}"
+fi
+
+# check 4: refuse a history rewrite of a protected ref.
+#
+# the server is where this belongs (synology.d/git-update-hook.sh on ds1,
+# the "history guard" ruleset on github), and both can be passed: the hook by
+# a client with a shell on ds1, the ruleset by its owner. this local half
+# fires first and names the override, so an accidental `push --force` or
+# `push origin :main` stops before the network. measured 2026-10-01: none of
+# the 20 ds1 repos refused either.
+#
+# by value, not by flag: git hands the hook the old and new sha of each ref,
+# so a `+refspec`, --mirror or a remote.<name>.mirror push is judged the same
+# as --force. a remote tip this clone does not hold cannot be judged here;
+# the range collection below already refuses that push as unverifiable, so
+# this check leaves it alone. ALLOW_REWRITE=1 is mintable by whoever runs
+# git, an agent included; the agent guard asks a human before such a push.
+PROTECTED_REF_RE='^refs/(heads/(main|master|develop)|tags/.+)$'
+if [[ "${ALLOW_REWRITE:-0}" != "1" ]]; then
+    while IFS=' ' read -r _L_REF L_SHA R_REF R_SHA; do
+        if [[ -z "${L_SHA}" || ! "${R_REF}" =~ ${PROTECTED_REF_RE} ]]; then
+            continue
+        fi
+        # a ref the remote does not have yet: nothing to rewrite
+        if [[ "${R_SHA}" =~ ^0+$ ]]; then
+            continue
+        fi
+        REWRITE=""
+        if [[ "${L_SHA}" =~ ^0+$ ]]; then
+            REWRITE="deletion"
+        elif [[ "${R_REF}" == refs/tags/* ]]; then
+            if [[ "${L_SHA}" != "${R_SHA}" ]]; then
+                REWRITE="tag move"
+            fi
+        elif git cat-file -e "${R_SHA}^{commit}" 2>/dev/null \
+            && ! git merge-base --is-ancestor "${R_SHA}" "${L_SHA}" 2>/dev/null; then
+            REWRITE="non-fast-forward"
+        fi
+        if [[ -n "${REWRITE}" ]]; then
+            printf '[fail] pre-push: refusing a history rewrite of %s (%s)\n' "${R_REF}" "${REWRITE}" >&2
+            printf '[info] override once, deliberately: ALLOW_REWRITE=1 git push ...\n' >&2
             exit 1
         fi
     done <<< "${REF_UPDATES}"
@@ -608,7 +726,8 @@ done <<< "${REF_UPDATES}"
 # Append the marker, do not reflow the line.
 #
 # Only whitespace, a comment introducer or an HTML comment closer may follow
-# the marker, because the strip has to reproduce the original line exactly.
+# the marker, because the strip has to reproduce the original line exactly,
+# and no letter, digit or "_" may precede it (FIXTURE_LINE_RE).
 # `<!-- pre-push: fixture -->` is the markdown form: the memory corpus
 # tabulates these patterns in prose, where a bare `#` is not a comment.
 #
@@ -624,7 +743,8 @@ tip_fixtures() {
     while IFS= read -r -d '' name && IFS= read -r line; do
         printf '%s\t%s\n' "${name#"${sha}":}" "${line}"
     done < <(git grep -z -F -e "${FIXTURE_MARKER}" "${sha}" 2>/dev/null || true) \
-        | sed "s/${FIXTURE_MARKER}.*$//" \
+        | grep -E -- "${FIXTURE_LINE_RE}" \
+        | sed -E "s/${FIXTURE_TAIL_RE}//" \
         | sed -E 's/[[:space:]]*<!--[[:space:]]*$//' \
         | sed 's/[[:space:]]*[#;]*[[:space:]]*$//' \
         | sed -E 's/[[:space:]]+$//' \
@@ -650,6 +770,29 @@ tip_fixtures() {
 # comment-strip's incidental coverage.
 if [[ "${#RANGES[@]}" -eq 0 ]]; then
     exit 0
+fi
+
+# true when commit $1 carries filter=lfs in a .gitattributes at any depth,
+# outside a comment: a commented `# *.bin filter=lfs` counted as LFS use and
+# refused a push without git-lfs (review of v1.23). a comment is a line whose
+# first non-blank character is `#`; a `#` later in the line is part of the
+# pattern. filter=lfs must stand as its own whitespace-separated attribute,
+# so myfilter=lfs and filter=lfs2 do not count (v1.25). a git grep error (rc > 1)
+# counts as LFS: git-lfs then reports the problem itself, or its absence
+# refuses the push.
+uses_lfs() {
+    local rc=0
+    git grep -q -E -e '^[[:space:]]*[^#[:space:]].*[[:space:]]filter=lfs([[:space:]]|$)' "${1}" -- .gitattributes '*/.gitattributes' 2>/dev/null || rc=$?
+    [[ "${rc}" -ne 1 ]]
+}
+# LFS use, read from the config, every pushed commit that changes a
+# .gitattributes (in the range loop) and every pushed tip (after it).
+USES_LFS=0
+# the commits of one range, keyed by name: a parent outside the range is
+# already on the remote, and its attributes push no LFS object.
+declare -A IN_RANGE=()
+if git config --get-regexp '^lfs\.' >/dev/null 2>&1; then
+    USES_LFS=1
 fi
 
 # stderr of the filename walk, read for git's rename-limit warning.
@@ -689,6 +832,71 @@ for (( RANGE_INDEX = 0; RANGE_INDEX < ${#RANGES[@]}; RANGE_INDEX++ )); do
         SKIPPED_NOTE="${SKIPPED_NOTE}${SKIPPED_NOTE:+; }$(( COUNT - MAX_COMMITS )) older commit(s) in ${ARGS[0]} not scanned"
     fi
 
+    # LFS use inside the range, not only at the tip: a commit that carried
+    # filter=lfs and a later one that dropped .gitattributes leave pointers in
+    # the published history (v1.23). every commit that changes a
+    # .gitattributes is read together with its parents inside the range;
+    # any other commit inherits its attributes from one of those, from the
+    # tip read below, or from a parent outside the range. that parent is
+    # already published; when the commit changes nothing but .gitattributes
+    # against it, its attributes cover no pushed file, so a push that only
+    # drops filter=lfs uploads nothing (v1.25). any other changed path may be
+    # an LFS pointer under that parent's attributes, so the parent counts
+    # (v1.26).
+    # no MAX_COMMITS cap: this walk prints commit names of the commits that
+    # touch .gitattributes and reads no patch, so it stays cheap on a long
+    # range; capped, LFS older than the newest 1000 attribute changes
+    # passed without git-lfs (v1.25).
+    # --full-history keeps a side-branch commit that a merge made TREESAME.
+    # --no-patch: --diff-merges=first-parent prints a merge's patch even
+    # under --format=%H, and its diff lines reached uses_lfs() as commit
+    # names, whose error counted as LFS use (review of v1.23).
+    if (( ! USES_LFS )); then
+        if ! ATTR_SHAS="$(git log --format=%H --no-patch --full-history --diff-merges=first-parent \
+            "${ARGS[@]}" -- .gitattributes '*/.gitattributes' 2>/dev/null)"; then
+            guard_abort "git log failed listing .gitattributes changes for range '${ARGS[0]}'; the LFS check did not run"
+        fi
+        IN_RANGE=()
+        if [[ -n "${ATTR_SHAS}" ]]; then
+            if ! RANGE_SHAS="$(git rev-list "${ARGS[@]}" 2>/dev/null)"; then
+                guard_abort "git rev-list failed listing the commits of range '${ARGS[0]}'; the LFS check did not run"
+            fi
+            while IFS= read -r SHA; do
+                IN_RANGE["${SHA}"]=1
+            done <<< "${RANGE_SHAS}"
+        fi
+        while IFS= read -r ATTR_SHA; do
+            [[ -z "${ATTR_SHA}" ]] && continue
+            # a failed lookup must not read as "no parents": an empty list
+            # skipped the parents and passed (v1.25). a root commit prints
+            # nothing and exits 0.
+            if ! ATTR_PARENTS="$(git rev-parse "${ATTR_SHA}^@" 2>/dev/null)"; then
+                guard_abort "git rev-parse failed listing the parents of ${ATTR_SHA}; the LFS check did not run"
+            fi
+            LFS_CANDIDATES=("${ATTR_SHA}")
+            while IFS= read -r SHA; do
+                [[ -z "${SHA}" ]] && continue
+                if [[ -n "${IN_RANGE["${SHA}"]:-}" ]]; then
+                    LFS_CANDIDATES+=("${SHA}")
+                    continue
+                fi
+                if ! OTHER_PATHS="$(git diff-tree --no-commit-id --name-only -r "${SHA}" "${ATTR_SHA}" \
+                    -- . ':(exclude).gitattributes' ':(exclude)*/.gitattributes' 2>/dev/null)"; then
+                    guard_abort "git diff-tree failed comparing ${ATTR_SHA} with its parent ${SHA}; the LFS check did not run"
+                fi
+                if [[ -n "${OTHER_PATHS}" ]]; then
+                    LFS_CANDIDATES+=("${SHA}")
+                fi
+            done <<< "${ATTR_PARENTS}"
+            for SHA in "${LFS_CANDIDATES[@]}"; do
+                if uses_lfs "${SHA}"; then
+                    USES_LFS=1
+                    break 2
+                fi
+            done
+        done <<< "${ATTR_SHAS}"
+    fi
+
     # one walk per range. -p over the range (rather than a squashed diff)
     # still catches a secret added in one commit and removed in a later
     # one: both remain in the published history.
@@ -705,8 +913,14 @@ for (( RANGE_INDEX = 0; RANGE_INDEX < ${#RANGES[@]}; RANGE_INDEX++ )); do
     # explicit prefixes: the fixture path key below is read from the
     # "+++ b/" header, and diff.noprefix or diff.dstPrefix in the user's
     # config changed that header, so no fixture marker matched (v1.18).
+    #
+    # --full-history: a path-limited walk otherwise follows only the parent
+    # a merge is TREESAME to, so after `merge -s ours` no commit of the side
+    # branch is read, although the push publishes them all. on git 2.53
+    # --diff-merges=first-parent happens to turn that pruning off as well;
+    # the flag states the requirement instead of relying on it (v1.23).
     if ! DIFF_RAW="$(git -c core.quotePath=false log -p --no-color --src-prefix=a/ --dst-prefix=b/ \
-        --diff-merges=first-parent --unified=0 "${LIMIT[@]}" "${ARGS[@]}" \
+        --full-history --diff-merges=first-parent --unified=0 "${LIMIT[@]}" "${ARGS[@]}" \
         -- . "${SCAN_EXCLUDE_PATHS[@]}" 2>/dev/null)"; then
         guard_abort "git log -p failed for range '${ARGS[0]}'; the content scan did not run"
     fi
@@ -743,7 +957,7 @@ for (( RANGE_INDEX = 0; RANGE_INDEX < ${#RANGES[@]}; RANGE_INDEX++ )); do
     # a redaction library put it after this marker in a published commit,
     # so the end-of-line rule refused every push of that commit.
     SCANNED="$(printf '%s\n' "${ADDED_P}" \
-        | grep -vE -- "${FIXTURE_MARKER}(,?[[:space:]]*secret-scan:allow)?[[:space:]]*(-->)?[[:space:]]*\$" || true)"
+        | grep -vE -- "${FIXTURE_LINE_RE}" || true)"
     # and the same line in its pre-marker form, per TIP_FIXTURES above, read
     # from this ref's own tip only. the emptiness guard is load-bearing: an
     # empty pattern list would feed grep a blank line, which matches
@@ -860,7 +1074,8 @@ for (( RANGE_INDEX = 0; RANGE_INDEX < ${#RANGES[@]}; RANGE_INDEX++ )); do
     # rebuild "status<TAB>path[<TAB>path]" records. an empty token separates
     # commits. a name with a control character is refused outright and never
     # echoed raw: it can rewrite the terminal the refusal is read on, and no
-    # legitimate file needs one.
+    # legitimate file needs one. a deletion of such a name removes the risk
+    # and passes (v1.23); its record is dropped all the same.
     PATHS_STATUS=""
     CTRL_PATHS=""
     NEED=0
@@ -869,11 +1084,14 @@ for (( RANGE_INDEX = 0; RANGE_INDEX < ${#RANGES[@]}; RANGE_INDEX++ )); do
         if (( NEED == 0 )); then
             [[ -z "${TOKEN}" ]] && continue
             RECORD="${TOKEN}"
+            STATUS="${TOKEN}"
             if [[ "${TOKEN}" =~ ^[RC] ]]; then NEED=2; else NEED=1; fi
             continue
         fi
         if [[ "${TOKEN}" == *[[:cntrl:]]* ]]; then
-            CTRL_PATHS="${CTRL_PATHS}$(printf '%s' "${TOKEN}" | LC_ALL=C tr '\001-\037\177' '?')"$'\n'
+            if [[ "${STATUS}" != D* ]]; then
+                CTRL_PATHS="${CTRL_PATHS}$(printf '%s' "${TOKEN}" | LC_ALL=C tr '\001-\037\177' '?')"$'\n'
+            fi
             RECORD=""
         elif [[ -n "${RECORD}" ]]; then
             RECORD="${RECORD}"$'\t'"${TOKEN}"
@@ -898,15 +1116,22 @@ for (( RANGE_INDEX = 0; RANGE_INDEX < ${#RANGES[@]}; RANGE_INDEX++ )); do
     # and never judges the target, whose name the pattern may not watch: the
     # key material is published under a harmless name. the source name is the
     # evidence, so these refuse whatever the target is called.
+    #
+    # one secret_paths() call over every source, then one join: a call per
+    # record forked five processes each, about 5 s on a 447-record range
+    # (review of v1.23). a name with a tab or newline never reaches here,
+    # the control-character check above drops its record.
+    RC_RECORDS="$(printf '%s' "${PATHS_STATUS}" | awk -F'\t' '$1 ~ /^[RC]/')"
     RENAMED_SECRETS=""
-    while IFS=$'\t' read -r _STATUS SRC DST; do
-        [[ "${_STATUS}" =~ ^[RC] ]] || continue
-        if grep -qE -- "${SECRET_PATH_PATTERN}" <<< "${SRC}" \
-            && ! grep -qE -- "${SECRET_PATH_ALLOW_PATTERN}" <<< "${SRC}"; then
-            if [[ "${_STATUS}" == C* ]]; then VERB="copied"; else VERB="renamed"; fi
-            RENAMED_SECRETS="${RENAMED_SECRETS}${SRC}"$'\t'"${VERB}"$'\t'"${DST}"$'\n'
+    if [[ -n "${RC_RECORDS}" ]]; then
+        SECRET_SOURCES="$(secret_paths "$(printf '%s\n' "${RC_RECORDS}" | cut -f2)")"
+        if [[ -n "${SECRET_SOURCES}" ]]; then
+            RENAMED_SECRETS="$(awk -F'\t' '
+                NR == FNR { secret[$0] = 1; next }
+                ($2 in secret) { print $2 "\t" ($1 ~ /^C/ ? "copied" : "renamed") "\t" $3 }' \
+                <(printf '%s\n' "${SECRET_SOURCES}") <(printf '%s\n' "${RC_RECORDS}"))"
         fi
-    done <<< "${PATHS_STATUS}"
+    fi
     if [[ -n "${RENAMED_SECRETS}" ]]; then
         printf '[error] pre-push: secret-shaped path(s) renamed or copied, content published under a new name:\n' >&2
         while IFS=$'\t' read -r SRC VERB DST; do
@@ -927,8 +1152,7 @@ for (( RANGE_INDEX = 0; RANGE_INDEX < ${#RANGES[@]}; RANGE_INDEX++ )); do
             printf '%s\n' "${SKIPPED_CONTENT}" | sed 's/^/[info]   /' >&2
         fi
 
-        BAD_PATHS="$(printf '%s\n' "${PATHS}" | grep -E -- "${SECRET_PATH_PATTERN}" \
-            | grep -vE -- "${SECRET_PATH_ALLOW_PATTERN}" || true)"
+        BAD_PATHS="$(secret_paths "${PATHS}")"
         if [[ -n "${BAD_PATHS}" ]]; then
             # a path the remote already carries was published by an earlier
             # push. blocking on it again cannot un-publish it, and since the
@@ -982,7 +1206,9 @@ for (( RANGE_INDEX = 0; RANGE_INDEX < ${#RANGES[@]}; RANGE_INDEX++ )); do
                         BASE_BLOBS+=("${BLOB}")
                     fi
                 done
-                if ! RANGE_SHAS="$(git log --format=%H --diff-merges=first-parent \
+                # --full-history for the reason given at the content walk,
+                # --no-patch for the one given at the LFS walk
+                if ! RANGE_SHAS="$(git log --format=%H --no-patch --full-history --diff-merges=first-parent \
                     "${LIMIT[@]}" "${ARGS[@]}" -- "${BAD_PATH}" 2>/dev/null)"; then
                     guard_abort "git log failed resolving range history of '${BAD_PATH}'; the already-published check did not run"
                 fi
@@ -1054,29 +1280,29 @@ printf '[pass] pre-push: no secret-shaped content or path detected\n' >&2
 # chain to git-lfs pre-push if the repo uses LFS. preserves the LFS-installed
 # pre-push behaviour (the hook git-lfs writes when `git lfs install` runs)
 # while keeping the security check ahead of it. the buffered ref updates are
-# replayed on its stdin, since this hook already consumed them. if either
-# side is missing, this block is a no-op (security check is sufficient).
+# replayed on its stdin, since this hook already consumed them. a push
+# without LFS use skips this block.
 #
-# LFS use is read from the .gitattributes of every PUSHED tip, at any depth.
+# LFS use is read from the pushed commits, at any depth (see uses_lfs()).
 # v1.17 read the checkout, so pushing an LFS branch from a non-LFS checkout
 # (or from a bare repository) skipped the upload and published pointers to
-# objects the remote never received. a git grep error (rc > 1) counts as
-# LFS: git-lfs then reports the problem itself.
-USES_LFS=0
-if git config --get-regexp '^lfs\.' >/dev/null 2>&1; then
-    USES_LFS=1
-fi
+# objects the remote never received.
 for SHA in "${TIP_SHAS[@]}"; do
     if (( USES_LFS )); then
         break
     fi
-    LFS_RC=0
-    git grep -q -F -e 'filter=lfs' "${SHA}" -- .gitattributes '*/.gitattributes' 2>/dev/null || LFS_RC=$?
-    if [[ "${LFS_RC}" -ne 1 ]]; then
+    if uses_lfs "${SHA}"; then
         USES_LFS=1
     fi
 done
-if (( USES_LFS )) && command -v git-lfs >/dev/null 2>&1; then
+if (( USES_LFS )); then
+    # fail closed (v1.23): without git-lfs the push published LFS pointers
+    # and exited 0, and the remote never received the objects.
+    if ! command -v git-lfs >/dev/null 2>&1; then
+        printf '[error] pre-push: this push uses git lfs, but git-lfs is not installed\n' >&2
+        printf '[info]  install git-lfs and push again, so the objects are uploaded\n' >&2
+        exit 1
+    fi
     printf '%s\n' "${REF_UPDATES}" | git lfs pre-push "$@"
     exit $?
 fi

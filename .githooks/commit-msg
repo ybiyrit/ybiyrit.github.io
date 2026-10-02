@@ -1,5 +1,14 @@
 #!/usr/bin/env bash
-# commit-msg hook: refuse a subject that records nothing, and refuse an
+# shellcheck shell=bash
+# commit-msg hook v1.2 created 2609 cl-bs updated 2610 cl-bs
+#
+# v1.1 skips a comment line only where git strips it ("#123 fix" with -m
+# read as an empty subject) and matches agent tokens as whole words (a
+# co-author named Devina was refused for "devin").
+# v1.2 refuses concatenated vendor names again (ClaudeCode, GitHubCopilot,
+# Claude4), which the v1.1 word boundary let through.
+#
+# refuse a subject that records nothing, and refuse an
 # agent provenance trailer
 #
 # 83997e3 landed on 2026-09-07 with the subject "Update". It carried 310
@@ -35,10 +44,35 @@ MSG_FILE="$1"
 # this assignment, so the commit is refused with no diagnostic at all and a
 # perfectly good long message is rejected. The loop has no such failure mode.
 # (fix from ybiyrit/talks e364b2f, 2026-09-22)
+#
+# a comment line is skipped only where git itself strips it. the hook reads
+# the message before git's cleanup runs, and the cleanup strips comment
+# lines only in strip mode: an editor commit by default, or
+# commit.cleanup=strip. with -m or -F git sets GIT_EDITOR=: for the hook and
+# keeps "#123 fix ..." as the subject, which the v1 skip read as an empty
+# subject (measured 2026-10-01, git 2.53). git strips a line that starts
+# with the comment string in column one, so leading whitespace keeps it.
+# known limits: a --cleanup flag is invisible to the hook, so only
+# commit.cleanup is read; under core.commentChar=auto (deprecated in git
+# 2.53) the chosen character is not knowable here, so no line is skipped.
+CLEANUP="$(git config --get commit.cleanup 2>/dev/null || true)"
+COMMENT="$(git config --get core.commentString 2>/dev/null || git config --get core.commentChar 2>/dev/null || true)"
+COMMENT="${COMMENT:-#}"
+STRIP=0
+if [[ "${CLEANUP}" == "strip" ]] \
+  || { [[ "${CLEANUP:-default}" == "default" && "${GIT_EDITOR:-}" != ":" ]]; }; then
+  STRIP=1
+fi
+if [[ "${COMMENT}" == "auto" ]]; then
+  STRIP=0
+fi
 SUBJECT=""
 LINE=""
 while IFS= read -r LINE || [[ -n "${LINE}" ]]; do
-  [[ "${LINE}" =~ ^[[:space:]]*(#|$) ]] && continue
+  [[ "${LINE}" =~ ^[[:space:]]*$ ]] && continue
+  if (( STRIP )) && [[ "${LINE}" == "${COMMENT}"* ]]; then
+    continue
+  fi
   SUBJECT="${LINE}"
   break
 done < "${MSG_FILE}"
@@ -88,7 +122,40 @@ fi
 # scope prefix and passes. A human co-author passes; only a vendor name in a
 # Co-Authored-By line fails. Verified by .githooks/test-commit-msg.sh, which
 # asserts one rejected sample per token and the passing controls.
+# tokens are not matched as bare substrings, so "devin" no longer refuses a
+# human co-author named Devina; agent_named() holds the boundaries.
 AGENT_TOKENS='claude|anthropic|copilot|gemini|antigravity|mistral|vibe|openai|chatgpt|codex|cursor|devin|aider|windsurf'
+
+# each token spelled case-insensitively, one bracket per letter, because
+# agent_named() matches case-sensitively. AGENT_CAP requires an upper-case
+# first letter, for a token that starts inside a word (GitHubCopilot).
+AGENT_CI=""
+AGENT_CAP=""
+IFS='|' read -r -a TOKEN_ARRAY <<<"${AGENT_TOKENS}"
+for TOKEN in "${TOKEN_ARRAY[@]}"; do
+  REST=""
+  for (( I = 1; I < ${#TOKEN}; I++ )); do
+    C="${TOKEN:I:1}"
+    REST+="[${C,,}${C^^}]"
+  done
+  FIRST="${TOKEN:0:1}"
+  AGENT_CI+="${AGENT_CI:+|}[${FIRST,,}${FIRST^^}]${REST}"
+  AGENT_CAP+="${AGENT_CAP:+|}${FIRST^^}${REST}"
+done
+readonly AGENT_CI AGENT_CAP
+
+# agent_named TEXT: true when TEXT names an agent token. the right boundary
+# is "not a lower-case letter": v1.1 required a non-alphanumeric there, so
+# ClaudeCode and Claude4 passed, while Devina (a lower-case continuation)
+# must pass. on the left, a token starts the text or follows a non-letter,
+# or starts with a capital inside a word (GitHubCopilot, OpenAICodex); a
+# lower-case run such as "precursor" is no agent name. C locale: [a-z] is
+# ascii lower case only.
+agent_named() {
+  local LC_ALL=C
+  [[ "${1}" =~ (^|[^[:alpha:]])(${AGENT_CI})([^a-z]|$) ]] \
+    || [[ "${1}" =~ [[:alpha:]](${AGENT_CAP})([^a-z]|$) ]]
+}
 
 fail_provenance() {
   printf '[fail] commit-msg: agent provenance trailer\n' >&2
@@ -167,9 +234,13 @@ while IFS= read -r LINE || [[ -n "${LINE}" ]]; do
   # shortcodes and punctuation repeat in any order: "- :robot: Generated
   # with Claude Code" passed a prefix that allowed a shortcode at the start
   # only (copilot review of research-academic#149).
-  if [[ "${NORM}" =~ ^([^[:alnum:]]|:[a-z_]+:)*generated[[:space:]]+(with|by)[[:space:]].*(${AGENT_TOKENS}) ]]; then
+  if [[ "${NORM}" =~ ^([^[:alnum:]]|:[a-z_]+:)*generated[[:space:]]+(with|by)[[:space:]](.*)$ ]]; then
+    REST="${BASH_REMATCH[3]}"
     shopt -u nocasematch
-    fail_provenance "${LINE}"
+    if agent_named "${REST}"; then
+      fail_provenance "${LINE}"
+    fi
+    shopt -s nocasematch
   fi
   # a symbol in front of "generated with/by" (the robot emoji) is the
   # watermark shape every agent CLI emits, so it fails even when the tool
@@ -186,9 +257,13 @@ while IFS= read -r LINE || [[ -n "${LINE}" ]]; do
   fi
   # any non-alphanumeric prefix: "# Co-Authored-By: Claude" passed the
   # whitespace-only anchor once comment lines were scanned (2026-09-30).
-  if [[ "${NORM}" =~ ^[^[:alnum:]]*co-authored-by:.*(${AGENT_TOKENS}) ]]; then
+  if [[ "${NORM}" =~ ^[^[:alnum:]]*co-authored-by:(.*)$ ]]; then
+    REST="${BASH_REMATCH[1]}"
     shopt -u nocasematch
-    fail_provenance "${LINE}"
+    if agent_named "${REST}"; then
+      fail_provenance "${LINE}"
+    fi
+    shopt -s nocasematch
   fi
   shopt -u nocasematch
 done < "${MSG_FILE}"
