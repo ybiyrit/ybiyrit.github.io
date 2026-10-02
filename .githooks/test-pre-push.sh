@@ -5,10 +5,10 @@
 #
 # ---
 # name: test-pre-push
-# version: v1.23
+# version: v1.25
 # created: 2026-08-02
 # created_by: cl-bs
-# updated: 2026-10-01
+# updated: 2026-10-02
 # updated_by: cl-bs
 # description: regression suite for the pre-push hook; proves in throwaway repositories that real pushes pass and planted secrets, secret-shaped names and leaky remotes are blocked
 # type: test
@@ -82,6 +82,12 @@
 # v1.23 pins hook v1.24 and the second review of hook v1.23: a --no-ff merge
 # of a .gitattributes without LFS, a commented lfs line, and a token line or
 # a secret-shaped name with an invalid UTF-8 byte under a UTF-8 locale.
+# v1.24 pins hook v1.25: filter=lfs as an attribute token (a `#` inside a
+# pattern, myfilter=lfs, filter=lfs2), an uncapped .gitattributes walk, a
+# push that only drops LFS, and a failed parent lookup; the PATH without
+# git-lfs links the running bash and the hook's tools by resolved path.
+# v1.25 pins hook v1.26: a commit that drops LFS and adds a file, linear,
+# as a --no-ff side branch and as a new branch.
 
 # a guard that blocks a legitimate push is worse than no guard, so the
 # suite asserts BOTH directions: real pushes stay allowed, planted
@@ -1264,8 +1270,14 @@ main() {
     # so only the missing git-lfs can change the outcome
     mkdir -p "${ROOT}/nolfs-bin"
     ln -s /usr/bin/* "${ROOT}/nolfs-bin/"
-    # git itself may live elsewhere (/usr/local/bin, a Homebrew prefix)
-    ln -sf "$(command -v git)" "${ROOT}/nolfs-bin/git"
+    # git, the bash this suite runs with, and every tool the hook calls may
+    # live elsewhere (/usr/local/bin, a Homebrew prefix): link each by the
+    # path this shell resolves (v1.24)
+    local NOLFS_TOOL
+    for NOLFS_TOOL in git env awk basename cat cut grep head mktemp rm sed sort tr; do
+        ln -sf "$(command -v "${NOLFS_TOOL}")" "${ROOT}/nolfs-bin/${NOLFS_TOOL}"
+    done
+    ln -sf "${BASH}" "${ROOT}/nolfs-bin/bash"
     rm -f "${ROOT}/nolfs-bin/git-lfs"
 
     # a pushed LFS ref with git-lfs missing published pointers to objects the
@@ -1422,6 +1434,106 @@ main() {
         _check "a secret-shaped name with an invalid utf-8 byte blocks: ${BAD_NAME//$'\377'/?}" 1 "${rc}"
     done
 
+    # v1.24 (hook v1.25): the third review of the LFS check.
+    # filter=lfs counts as an attribute token only: a `#` inside a pattern is
+    # no comment, and myfilter=lfs or filter=lfs2 is no LFS use
+    local ATTR_LINE
+    for ATTR_LINE in '*.bin myfilter=lfs' '*.bin filter=lfs2' '   # *.bin filter=lfs'; do
+        _setup_repo
+        git push -q origin main 2>/dev/null
+        printf '%s\n' "${ATTR_LINE}" > .gitattributes
+        git add .gitattributes
+        git commit -qm "attributes that are no lfs use"
+        rc="$(_rc env GIT_CONFIG_GLOBAL=/dev/null PATH="${ROOT}/nolfs-bin" git push -q origin main 2>"${ROOT}/n1")"
+        _check "no lfs use passes without git-lfs: ${ATTR_LINE}" 0 "${rc}"
+    done
+    _setup_repo
+    git push -q origin main 2>/dev/null
+    printf 'a#b.bin filter=lfs diff=lfs merge=lfs -text\n' > .gitattributes
+    git add .gitattributes
+    git commit -qm "lfs for a pattern with a hash"
+    rc="$(_rc env GIT_CONFIG_GLOBAL=/dev/null PATH="${ROOT}/nolfs-bin" git push -q origin main 2>"${ROOT}/n2")"
+    _check "lfs on a pattern containing # refuses without git-lfs" 1 "${rc}"
+
+    # a push that only removes the LFS attributes uploads no LFS object: the
+    # parent outside the range is no part of the push. the base goes up with
+    # the fake git-lfs on PATH.
+    _setup_repo
+    printf '*.bin filter=lfs diff=lfs merge=lfs -text\n' > .gitattributes
+    git add .gitattributes
+    git commit -qm "track binaries in lfs"
+    env GIT_CONFIG_GLOBAL=/dev/null PATH="${ROOT}/fakebin:${PATH}" git push -q origin main 2>/dev/null
+    git rm -q .gitattributes
+    git commit -qm "stop tracking binaries in lfs"
+    rc="$(_rc env GIT_CONFIG_GLOBAL=/dev/null PATH="${ROOT}/nolfs-bin" git push -q origin main 2>"${ROOT}/n3")"
+    _check "a push that only drops lfs passes without git-lfs" 0 "${rc}"
+
+    # a commit that drops the LFS attributes AND adds a file still pushes an
+    # LFS pointer under the published parent's attributes: linear, as a
+    # --no-ff side branch, and as a new branch (review of hook v1.25)
+    local LFS_SHAPE
+    for LFS_SHAPE in linear no-ff new-branch; do
+        _setup_repo
+        printf '*.bin filter=lfs diff=lfs merge=lfs -text\n' > .gitattributes
+        git add .gitattributes
+        git commit -qm "track binaries in lfs"
+        env GIT_CONFIG_GLOBAL=/dev/null PATH="${ROOT}/fakebin:${PATH}" git push -q origin main 2>/dev/null
+        if [[ "${LFS_SHAPE}" != "linear" ]]; then
+            git switch -q -c side
+        fi
+        git rm -q .gitattributes
+        printf 'version https://git-lfs.github.com/spec/v1\n' > a.bin
+        git add a.bin
+        git commit -qm "drop lfs and add a pointer"
+        if [[ "${LFS_SHAPE}" == "no-ff" ]]; then
+            git switch -q main
+            git merge -q --no-ff --no-edit side
+        fi
+        local PUSH_REF="main"
+        if [[ "${LFS_SHAPE}" == "new-branch" ]]; then
+            PUSH_REF="side"
+        fi
+        rc="$(_rc env GIT_CONFIG_GLOBAL=/dev/null PATH="${ROOT}/nolfs-bin" git push -q origin "${PUSH_REF}" 2>"${ROOT}/n6")"
+        _check "dropping lfs while adding a file refuses without git-lfs: ${LFS_SHAPE}" 1 "${rc}"
+    done
+
+    # the .gitattributes walk is not capped at MAX_COMMITS: lfs in the oldest
+    # of 1002 attribute changes still refuses without git-lfs
+    _setup_repo
+    git push -q origin main 2>/dev/null
+    local BASE_SHA I ATTR_BODY
+    BASE_SHA="$(git rev-parse HEAD)"
+    {
+        for (( I = 1; I <= 1002; I++ )); do
+            ATTR_BODY="*.t${I} text"
+            if (( I == 1 )); then ATTR_BODY='*.bin filter=lfs diff=lfs merge=lfs -text'; fi
+            printf 'commit refs/heads/main\ncommitter t <t@example.invalid> %d +0000\ndata 7\nattr %02d\n' "$(( 1700000000 + I ))" "$(( I % 100 ))"
+            if (( I == 1 )); then printf 'from %s\n' "${BASE_SHA}"; fi
+            printf 'M 100644 inline .gitattributes\ndata %d\n%s\n\n' "$(( ${#ATTR_BODY} + 1 ))" "${ATTR_BODY}"
+        done
+    } | git fast-import --quiet --force
+    git reset -q --hard main
+    rc="$(_rc env GIT_CONFIG_GLOBAL=/dev/null PATH="${ROOT}/nolfs-bin" git push -q origin main 2>"${ROOT}/n4")"
+    _check "lfs beyond MAX_COMMITS attribute changes refuses without git-lfs" 1 "${rc}"
+
+    # a failed parent lookup refuses the push; an empty list failed open.
+    # git puts its exec-path first on the hook's PATH, so a wrapper earlier
+    # on PATH never runs; the wrapper replaces git in a copy of the exec-path
+    mkdir -p "${ROOT}/badparent-exec"
+    ln -s "$(git --exec-path)"/* "${ROOT}/badparent-exec/"
+    rm -f "${ROOT}/badparent-exec/git"
+    printf '#!/bin/sh\nif [ "$1" = rev-parse ]; then case "$2" in *^@) exit 128 ;; esac; fi\nexec %q "$@"\n' \
+        "$(command -v git)" > "${ROOT}/badparent-exec/git"
+    chmod +x "${ROOT}/badparent-exec/git"
+    _setup_repo
+    git push -q origin main 2>/dev/null
+    printf '*.txt text\n' > .gitattributes
+    git add .gitattributes
+    git commit -qm "attributes without lfs"
+    rc="$(_rc env GIT_CONFIG_GLOBAL=/dev/null GIT_EXEC_PATH="${ROOT}/badparent-exec" PATH="${ROOT}/nolfs-bin" git push -q origin main 2>"${ROOT}/n5")"
+    _check "a failed parent lookup refuses the push" 1 "${rc}"
+    _expect_output "the refusal names the parent lookup" yes "parents" "${ROOT}/n5"
+
     # a relative candidate reaches the hook, end to end: the suite runs again
     # with a relative PRE_PUSH_HOOK naming a copy of the hook that records
     # each call, and must pass with the record present. a bare run and make
@@ -1445,6 +1557,38 @@ main() {
             _FAIL=$(( _FAIL + 1 ))
         fi
     fi
+
+    # v1.25 check 4: a history rewrite of a protected ref, judged by value
+    # on a non-forge remote, so check 3 stays out of the way. each refusal
+    # has an allowed twin.
+    _setup_repo
+    local z c1 c2 c3
+    z="0000000000000000000000000000000000000000"
+    c1="$(git rev-parse HEAD)"
+    git commit -q --allow-empty -m c2
+    c2="$(git rev-parse HEAD)"
+    git checkout -q -b side "${c1}"
+    git commit -q --allow-empty -m c3
+    c3="$(git rev-parse HEAD)"
+    rw() { _rc bash "${HOOK}" origin "${ROOT}/remote.git" <<< "${1}" 2>"${ROOT}/rw"; }
+    _check "rewrite: fast-forward on main passes" 0 "$(rw "refs/heads/main ${c2} refs/heads/main ${c1}")"
+    _check "rewrite: non-fast-forward on main refused" 1 "$(rw "refs/heads/main ${c3} refs/heads/main ${c2}")"
+    _expect_output "rewrite: the refusal names the override" yes "ALLOW_REWRITE=1" "${ROOT}/rw"
+    rc="$(ALLOW_REWRITE=1 _rc bash "${HOOK}" origin "${ROOT}/remote.git" \
+        <<< "refs/heads/main ${c3} refs/heads/main ${c2}" 2>"${ROOT}/rw")"
+    _check "rewrite: ALLOW_REWRITE=1 lets it through" 0 "${rc}"
+    _check "rewrite: non-fast-forward on develop refused" 1 "$(rw "refs/heads/develop ${c3} refs/heads/develop ${c2}")"
+    _check "rewrite: non-fast-forward on master refused" 1 "$(rw "refs/heads/master ${c3} refs/heads/master ${c2}")"
+    _check "rewrite: non-fast-forward on a work branch passes" 0 "$(rw "refs/heads/wip/x ${c3} refs/heads/wip/x ${c2}")"
+    _check "rewrite: deleting main refused" 1 "$(rw "(delete) ${z} refs/heads/main ${c2}")"
+    _check "rewrite: deleting a work branch passes" 0 "$(rw "(delete) ${z} refs/heads/wip/x ${c2}")"
+    _check "rewrite: creating a tag passes" 0 "$(rw "refs/tags/v1 ${c1} refs/tags/v1 ${z}")"
+    _check "rewrite: moving a tag refused" 1 "$(rw "refs/tags/v1 ${c2} refs/tags/v1 ${c1}")"
+    _check "rewrite: deleting a tag refused" 1 "$(rw "(delete) ${z} refs/tags/v1 ${c1}")"
+    _check "rewrite: an unknown remote tip on main refused" 1 \
+        "$(rw "refs/heads/main ${c2} refs/heads/main 1111111111111111111111111111111111111111")"
+    _expect_output "rewrite: the unknown tip is refused as unverifiable" yes "fetch the remote" "${ROOT}/rw"
+    git checkout -q main
 
     printf '\n[info] %d passed, %d failed\n' "${_PASS}" "${_FAIL}"
     [[ "${_FAIL}" -eq 0 ]]

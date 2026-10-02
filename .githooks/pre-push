@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # shellcheck shell=bash
-# pre-push hook v1.24 created 2605 cl-bs updated 2610 cl-bs
+# pre-push hook v1.26 created 2605 cl-bs updated 2610 cl-bs
 #
 # universal pre-push guard. three independent checks, all fail closed:
 #
@@ -58,6 +58,22 @@
 # (reachable via `git config remote.<name>.url` naming an odd remote, or
 # `git push '*' ref`) either widened the `--glob=refs/remotes/NAME/*`
 # exclusion past that one remote or broke the `|`-packed range split.
+#
+# v1.26 (2026-10-02) reads a published parent again when the commit also
+# changes a path other than .gitattributes: v1.25 skipped it for every
+# commit, so a commit that dropped filter=lfs and added a pointer under the
+# parent's attributes passed without git-lfs.
+#
+# v1.25 (2026-10-02) also adds check 4, landed in parallel as b5b5ff02:
+# a history rewrite of a protected ref is refused (ALLOW_REWRITE=1 once).
+#
+# v1.25 (2026-10-02) closes a third review of the LFS check: filter=lfs
+# counted anywhere after a `#` was ruled out, though .gitattributes reads
+# `#` as a comment only at the start of a line, and inside a longer word
+# (myfilter=lfs, filter=lfs2); the .gitattributes walk shared the content
+# cap, so LFS older than the newest 1000 attribute changes passed; a parent
+# outside the range was read, so a push that only drops LFS was refused
+# without git-lfs; and a failed parent lookup read as "no parents".
 #
 # v1.24 (2026-10-01) runs in the C locale. GNU grep 3.12 under a UTF-8
 # locale reads a line with an invalid UTF-8 byte as binary, prints "binary
@@ -135,6 +151,9 @@
 #   3. default branch: refuse a direct push to main, master or the remote's
 #      recorded default branch when the remote is a PR forge (github.com).
 #      ALLOW_PUSH_TO_MAIN=1 overrides once, deliberately.
+#   4. history: refuse a non-fast-forward update, a deletion or a tag move
+#      of main, master, develop or any tag, on every remote.
+#      ALLOW_REWRITE=1 overrides once, deliberately.
 #
 # one repository holds the master of this file, and every other copy is a
 # mirror: a sync step copies the master into every discovered repo's
@@ -585,6 +604,50 @@ if [[ "${ALLOW_PUSH_TO_MAIN:-0}" != "1" && ( "${REMOTE_HOST}" == "github.com" ||
     done <<< "${REF_UPDATES}"
 fi
 
+# check 4: refuse a history rewrite of a protected ref.
+#
+# the server is where this belongs (synology.d/git-update-hook.sh on ds1,
+# the "history guard" ruleset on github), and both can be passed: the hook by
+# a client with a shell on ds1, the ruleset by its owner. this local half
+# fires first and names the override, so an accidental `push --force` or
+# `push origin :main` stops before the network. measured 2026-10-01: none of
+# the 20 ds1 repos refused either.
+#
+# by value, not by flag: git hands the hook the old and new sha of each ref,
+# so a `+refspec`, --mirror or a remote.<name>.mirror push is judged the same
+# as --force. a remote tip this clone does not hold cannot be judged here;
+# the range collection below already refuses that push as unverifiable, so
+# this check leaves it alone. ALLOW_REWRITE=1 is mintable by whoever runs
+# git, an agent included; the agent guard asks a human before such a push.
+PROTECTED_REF_RE='^refs/(heads/(main|master|develop)|tags/.+)$'
+if [[ "${ALLOW_REWRITE:-0}" != "1" ]]; then
+    while IFS=' ' read -r _L_REF L_SHA R_REF R_SHA; do
+        if [[ -z "${L_SHA}" || ! "${R_REF}" =~ ${PROTECTED_REF_RE} ]]; then
+            continue
+        fi
+        # a ref the remote does not have yet: nothing to rewrite
+        if [[ "${R_SHA}" =~ ^0+$ ]]; then
+            continue
+        fi
+        REWRITE=""
+        if [[ "${L_SHA}" =~ ^0+$ ]]; then
+            REWRITE="deletion"
+        elif [[ "${R_REF}" == refs/tags/* ]]; then
+            if [[ "${L_SHA}" != "${R_SHA}" ]]; then
+                REWRITE="tag move"
+            fi
+        elif git cat-file -e "${R_SHA}^{commit}" 2>/dev/null \
+            && ! git merge-base --is-ancestor "${R_SHA}" "${L_SHA}" 2>/dev/null; then
+            REWRITE="non-fast-forward"
+        fi
+        if [[ -n "${REWRITE}" ]]; then
+            printf '[fail] pre-push: refusing a history rewrite of %s (%s)\n' "${R_REF}" "${REWRITE}" >&2
+            printf '[info] override once, deliberately: ALLOW_REWRITE=1 git push ...\n' >&2
+            exit 1
+        fi
+    done <<< "${REF_UPDATES}"
+fi
+
 # collect the rev ranges this push would publish.
 RANGES=()
 # the remote-side sha per range, or "" for a ref the remote does not have
@@ -711,17 +774,23 @@ fi
 
 # true when commit $1 carries filter=lfs in a .gitattributes at any depth,
 # outside a comment: a commented `# *.bin filter=lfs` counted as LFS use and
-# refused a push without git-lfs (review of v1.23). a git grep error (rc > 1)
+# refused a push without git-lfs (review of v1.23). a comment is a line whose
+# first non-blank character is `#`; a `#` later in the line is part of the
+# pattern. filter=lfs must stand as its own whitespace-separated attribute,
+# so myfilter=lfs and filter=lfs2 do not count (v1.25). a git grep error (rc > 1)
 # counts as LFS: git-lfs then reports the problem itself, or its absence
 # refuses the push.
 uses_lfs() {
     local rc=0
-    git grep -q -E -e '^[^#]*filter=lfs' "${1}" -- .gitattributes '*/.gitattributes' 2>/dev/null || rc=$?
+    git grep -q -E -e '^[[:space:]]*[^#[:space:]].*[[:space:]]filter=lfs([[:space:]]|$)' "${1}" -- .gitattributes '*/.gitattributes' 2>/dev/null || rc=$?
     [[ "${rc}" -ne 1 ]]
 }
 # LFS use, read from the config, every pushed commit that changes a
 # .gitattributes (in the range loop) and every pushed tip (after it).
 USES_LFS=0
+# the commits of one range, keyed by name: a parent outside the range is
+# already on the remote, and its attributes push no LFS object.
+declare -A IN_RANGE=()
 if git config --get-regexp '^lfs\.' >/dev/null 2>&1; then
     USES_LFS=1
 fi
@@ -766,21 +835,60 @@ for (( RANGE_INDEX = 0; RANGE_INDEX < ${#RANGES[@]}; RANGE_INDEX++ )); do
     # LFS use inside the range, not only at the tip: a commit that carried
     # filter=lfs and a later one that dropped .gitattributes leave pointers in
     # the published history (v1.23). every commit that changes a
-    # .gitattributes is read together with its parents; any other commit
-    # inherits its attributes from one of those, or from the tip read below.
+    # .gitattributes is read together with its parents inside the range;
+    # any other commit inherits its attributes from one of those, from the
+    # tip read below, or from a parent outside the range. that parent is
+    # already published; when the commit changes nothing but .gitattributes
+    # against it, its attributes cover no pushed file, so a push that only
+    # drops filter=lfs uploads nothing (v1.25). any other changed path may be
+    # an LFS pointer under that parent's attributes, so the parent counts
+    # (v1.26).
+    # no MAX_COMMITS cap: this walk prints commit names of the commits that
+    # touch .gitattributes and reads no patch, so it stays cheap on a long
+    # range; capped, LFS older than the newest 1000 attribute changes
+    # passed without git-lfs (v1.25).
     # --full-history keeps a side-branch commit that a merge made TREESAME.
     # --no-patch: --diff-merges=first-parent prints a merge's patch even
     # under --format=%H, and its diff lines reached uses_lfs() as commit
     # names, whose error counted as LFS use (review of v1.23).
     if (( ! USES_LFS )); then
         if ! ATTR_SHAS="$(git log --format=%H --no-patch --full-history --diff-merges=first-parent \
-            "${LIMIT[@]}" "${ARGS[@]}" -- .gitattributes '*/.gitattributes' 2>/dev/null)"; then
+            "${ARGS[@]}" -- .gitattributes '*/.gitattributes' 2>/dev/null)"; then
             guard_abort "git log failed listing .gitattributes changes for range '${ARGS[0]}'; the LFS check did not run"
+        fi
+        IN_RANGE=()
+        if [[ -n "${ATTR_SHAS}" ]]; then
+            if ! RANGE_SHAS="$(git rev-list "${ARGS[@]}" 2>/dev/null)"; then
+                guard_abort "git rev-list failed listing the commits of range '${ARGS[0]}'; the LFS check did not run"
+            fi
+            while IFS= read -r SHA; do
+                IN_RANGE["${SHA}"]=1
+            done <<< "${RANGE_SHAS}"
         fi
         while IFS= read -r ATTR_SHA; do
             [[ -z "${ATTR_SHA}" ]] && continue
-            mapfile -t ATTR_PARENTS < <(git rev-parse "${ATTR_SHA}^@" 2>/dev/null || true)
-            for SHA in "${ATTR_SHA}" "${ATTR_PARENTS[@]}"; do
+            # a failed lookup must not read as "no parents": an empty list
+            # skipped the parents and passed (v1.25). a root commit prints
+            # nothing and exits 0.
+            if ! ATTR_PARENTS="$(git rev-parse "${ATTR_SHA}^@" 2>/dev/null)"; then
+                guard_abort "git rev-parse failed listing the parents of ${ATTR_SHA}; the LFS check did not run"
+            fi
+            LFS_CANDIDATES=("${ATTR_SHA}")
+            while IFS= read -r SHA; do
+                [[ -z "${SHA}" ]] && continue
+                if [[ -n "${IN_RANGE["${SHA}"]:-}" ]]; then
+                    LFS_CANDIDATES+=("${SHA}")
+                    continue
+                fi
+                if ! OTHER_PATHS="$(git diff-tree --no-commit-id --name-only -r "${SHA}" "${ATTR_SHA}" \
+                    -- . ':(exclude).gitattributes' ':(exclude)*/.gitattributes' 2>/dev/null)"; then
+                    guard_abort "git diff-tree failed comparing ${ATTR_SHA} with its parent ${SHA}; the LFS check did not run"
+                fi
+                if [[ -n "${OTHER_PATHS}" ]]; then
+                    LFS_CANDIDATES+=("${SHA}")
+                fi
+            done <<< "${ATTR_PARENTS}"
+            for SHA in "${LFS_CANDIDATES[@]}"; do
                 if uses_lfs "${SHA}"; then
                     USES_LFS=1
                     break 2
