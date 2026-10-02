@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # shellcheck shell=bash
-# pre-push hook v1.26 created 2605 cl-bs updated 2610 cl-bs
+# pre-push hook v1.28 created 2605 cl-bs updated 2610 cl-bs
 #
-# universal pre-push guard. three independent checks, all fail closed:
+# universal pre-push guard. four independent checks, all fail closed:
 #
 # "fail closed" is load-bearing and was not true before v1.4: an errored git
 # command and an unresolvable remote URL each used to read as "found
@@ -58,6 +58,16 @@
 # (reachable via `git config remote.<name>.url` naming an odd remote, or
 # `git push '*' ref`) either widened the `--glob=refs/remotes/NAME/*`
 # exclusion past that one remote or broke the `|`-packed range split.
+#
+# v1.28 (2026-10-02) counts a published parent's attributes when any commit
+# of the range changes another path: a push of one commit that drops
+# .gitattributes and a later one that adds a pointer passed without git-lfs.
+#
+# v1.27 (2026-10-02) parses a .gitattributes line as git does: a pattern in
+# double quotes is one field, so "a filter=lfs b" is a pattern and no LFS use
+# (git 2.53 check-attr reports filter unspecified). the .gitattributes walk
+# keeps the parents of the attribute commits only, not every commit of an
+# uncapped range.
 #
 # v1.26 (2026-10-02) reads a published parent again when the commit also
 # changes a path other than .gitattributes: v1.25 skipped it for every
@@ -737,12 +747,13 @@ done <<< "${REF_UPDATES}"
 # marker on one branch exempted another branch whose tip never carried it.
 # A path git would quote in the diff header (a tab, a double quote) does not
 # match its raw git-grep name; the line then stays in the scan, which is the
-# safe direction.
+# safe direction. the user's colour and line-number config would reshape
+# every record the same way (v1.27, as in uses_lfs()).
 tip_fixtures() {
     local sha="${1}" name line
     while IFS= read -r -d '' name && IFS= read -r line; do
         printf '%s\t%s\n' "${name#"${sha}":}" "${line}"
-    done < <(git grep -z -F -e "${FIXTURE_MARKER}" "${sha}" 2>/dev/null || true) \
+    done < <(git grep --no-color --no-line-number --no-column -z -F -e "${FIXTURE_MARKER}" "${sha}" 2>/dev/null || true) \
         | grep -E -- "${FIXTURE_LINE_RE}" \
         | sed -E "s/${FIXTURE_TAIL_RE}//" \
         | sed -E 's/[[:space:]]*<!--[[:space:]]*$//' \
@@ -777,19 +788,80 @@ fi
 # refused a push without git-lfs (review of v1.23). a comment is a line whose
 # first non-blank character is `#`; a `#` later in the line is part of the
 # pattern. filter=lfs must stand as its own whitespace-separated attribute,
-# so myfilter=lfs and filter=lfs2 do not count (v1.25). a git grep error (rc > 1)
-# counts as LFS: git-lfs then reports the problem itself, or its absence
-# refuses the push.
+# so myfilter=lfs and filter=lfs2 do not count (v1.25). the pattern is the
+# first field; a field that opens with `"` and closes under git's C quoting
+# rules is one pattern, spaces included, so "a filter=lfs b" sets no
+# attribute (v1.27, after attr.c parse_attr_line and quote.c
+# unquote_c_style). an unterminated quote falls back to a field ended by a
+# blank, as git does. the lines are parsed, so the user's config must not
+# reshape them: color.ui=always wrapped the match in escapes, a binary or
+# -diff attribute on .gitattributes printed "Binary file ... matches", and
+# grep.lineNumber put a number before a quoted pattern; the first two
+# passed a real LFS use (fable review of v1.27). a git grep error (rc > 1)
+# counts as LFS, and so does any awk verdict other than "none": git-lfs then
+# reports the problem itself, or its absence refuses the push.
 uses_lfs() {
-    local rc=0
-    git grep -q -E -e '^[[:space:]]*[^#[:space:]].*[[:space:]]filter=lfs([[:space:]]|$)' "${1}" -- .gitattributes '*/.gitattributes' 2>/dev/null || rc=$?
-    [[ "${rc}" -ne 1 ]]
+    local rc=0 lines verdict
+    lines="$(git grep -a --no-color --no-line-number --no-column -h -F -e 'filter=lfs' "${1}" -- .gitattributes '*/.gitattributes' 2>/dev/null)" || rc=$?
+    if (( rc > 1 )); then
+        return 0
+    fi
+    if (( rc == 1 )); then
+        return 1
+    fi
+    verdict="$(awk '
+        function attrs_of(s,    i, n, c, d) {
+            if (substr(s, 1, 1) == "\"") {
+                n = length(s)
+                i = 2
+                while (i <= n) {
+                    c = substr(s, i, 1)
+                    if (c == "\"") {
+                        return substr(s, i + 1)
+                    }
+                    if (c == "\\") {
+                        d = substr(s, i + 1, 1)
+                        if (d != "" && index("abfnrtv\\\"", d)) {
+                            i += 2
+                            continue
+                        }
+                        if (d ~ /^[0-3]$/ && substr(s, i + 2, 2) ~ /^[0-7][0-7]$/) {
+                            i += 4
+                            continue
+                        }
+                        break
+                    }
+                    i++
+                }
+            }
+            if (match(s, /[ \t\r]/)) {
+                return substr(s, RSTART)
+            }
+            return ""
+        }
+        {
+            s = $0
+            sub(/^[ \t\r]+/, "", s)
+            if (s == "" || substr(s, 1, 1) == "#") {
+                next
+            }
+            n = split(attrs_of(s), t, /[ \t\r]+/)
+            for (j = 1; j <= n; j++) {
+                if (t[j] == "filter=lfs") {
+                    found = 1
+                }
+            }
+        }
+        END { print (found ? "lfs" : "none") }
+    ' <<< "${lines}")" || verdict="error"
+    [[ "${verdict}" != "none" ]]
 }
 # LFS use, read from the config, every pushed commit that changes a
 # .gitattributes (in the range loop) and every pushed tip (after it).
 USES_LFS=0
-# the commits of one range, keyed by name: a parent outside the range is
-# already on the remote, and its attributes push no LFS object.
+# the parents of the attribute commits that lie inside one range, keyed by
+# name: a parent outside the range is already on the remote, and its
+# attributes push no LFS object.
 declare -A IN_RANGE=()
 if git config --get-regexp '^lfs\.' >/dev/null 2>&1; then
     USES_LFS=1
@@ -842,7 +914,12 @@ for (( RANGE_INDEX = 0; RANGE_INDEX < ${#RANGES[@]}; RANGE_INDEX++ )); do
     # against it, its attributes cover no pushed file, so a push that only
     # drops filter=lfs uploads nothing (v1.25). any other changed path may be
     # an LFS pointer under that parent's attributes, so the parent counts
-    # (v1.26).
+    # (v1.26), and so does any path another commit of the range changes: a
+    # commit that only dropped .gitattributes followed by one that added a
+    # pointer passed (v1.28, copilot reviews of dhbw#18 and polder#7). the
+    # cost, accepted because it fails closed: a push that drops LFS and
+    # changes any other path (a README edit, an `-s ours` merge) needs
+    # git-lfs, whether or not a pointer leaves.
     # no MAX_COMMITS cap: this walk prints commit names of the commits that
     # touch .gitattributes and reads no patch, so it stays cheap on a long
     # range; capped, LFS older than the newest 1000 attribute changes
@@ -857,14 +934,12 @@ for (( RANGE_INDEX = 0; RANGE_INDEX < ${#RANGES[@]}; RANGE_INDEX++ )); do
             guard_abort "git log failed listing .gitattributes changes for range '${ARGS[0]}'; the LFS check did not run"
         fi
         IN_RANGE=()
-        if [[ -n "${ATTR_SHAS}" ]]; then
-            if ! RANGE_SHAS="$(git rev-list "${ARGS[@]}" 2>/dev/null)"; then
-                guard_abort "git rev-list failed listing the commits of range '${ARGS[0]}'; the LFS check did not run"
-            fi
-            while IFS= read -r SHA; do
-                IN_RANGE["${SHA}"]=1
-            done <<< "${RANGE_SHAS}"
-        fi
+        declare -A PARENTS_OF=()
+        PARENT_LIST=""
+        # set on first use below: yes when a commit of the range changes a
+        # path other than .gitattributes. one commit answers it, so the walk
+        # stops at the first.
+        RANGE_OTHER=""
         while IFS= read -r ATTR_SHA; do
             [[ -z "${ATTR_SHA}" ]] && continue
             # a failed lookup must not read as "no parents": an empty list
@@ -873,6 +948,31 @@ for (( RANGE_INDEX = 0; RANGE_INDEX < ${#RANGES[@]}; RANGE_INDEX++ )); do
             if ! ATTR_PARENTS="$(git rev-parse "${ATTR_SHA}^@" 2>/dev/null)"; then
                 guard_abort "git rev-parse failed listing the parents of ${ATTR_SHA}; the LFS check did not run"
             fi
+            PARENTS_OF["${ATTR_SHA}"]="${ATTR_PARENTS}"
+            PARENT_LIST="${PARENT_LIST}${ATTR_PARENTS}"$'\n'
+        done <<< "${ATTR_SHAS}"
+        # range membership is tested for those parents only: v1.26 held every
+        # commit of the uncapped range in this array, so a first push of a
+        # long history grew the shell with it (copilot reviews of claude#9
+        # and delvrit#9). awk reads rev-list to the end and exits 0, so under
+        # pipefail the status is the status of rev-list. the parents reach awk
+        # as a file, not as -v: one argument is capped at 128 KiB, about
+        # 3,190 parents, and past that a long first push was refused (fable
+        # review of v1.27).
+        if [[ -n "${PARENT_LIST//$'\n'/}" ]]; then
+            if ! PARENTS_IN_RANGE="$(git rev-list "${ARGS[@]}" 2>/dev/null \
+                | awk 'NR == FNR { if ($0 != "") want[$0] = 1; next } ($0 in want)' <(printf '%s' "${PARENT_LIST}") -)"; then
+                guard_abort "git rev-list failed listing the commits of range '${ARGS[0]}'; the LFS check did not run"
+            fi
+            while IFS= read -r SHA; do
+                if [[ -n "${SHA}" ]]; then
+                    IN_RANGE["${SHA}"]=1
+                fi
+            done <<< "${PARENTS_IN_RANGE}"
+        fi
+        while IFS= read -r ATTR_SHA; do
+            [[ -z "${ATTR_SHA}" ]] && continue
+            ATTR_PARENTS="${PARENTS_OF["${ATTR_SHA}"]}"
             LFS_CANDIDATES=("${ATTR_SHA}")
             while IFS= read -r SHA; do
                 [[ -z "${SHA}" ]] && continue
@@ -884,7 +984,17 @@ for (( RANGE_INDEX = 0; RANGE_INDEX < ${#RANGES[@]}; RANGE_INDEX++ )); do
                     -- . ':(exclude).gitattributes' ':(exclude)*/.gitattributes' 2>/dev/null)"; then
                     guard_abort "git diff-tree failed comparing ${ATTR_SHA} with its parent ${SHA}; the LFS check did not run"
                 fi
-                if [[ -n "${OTHER_PATHS}" ]]; then
+                if [[ -z "${OTHER_PATHS}" && -z "${RANGE_OTHER}" ]]; then
+                    if ! RANGE_OTHER_SHA="$(git log --format=%H --no-patch --full-history --diff-merges=first-parent \
+                        --max-count=1 "${ARGS[@]}" -- . ':(exclude).gitattributes' ':(exclude)*/.gitattributes' 2>/dev/null)"; then
+                        guard_abort "git log failed listing the other changes of range '${ARGS[0]}'; the LFS check did not run"
+                    fi
+                    RANGE_OTHER="no"
+                    if [[ -n "${RANGE_OTHER_SHA}" ]]; then
+                        RANGE_OTHER="yes"
+                    fi
+                fi
+                if [[ -n "${OTHER_PATHS}" || "${RANGE_OTHER}" == "yes" ]]; then
                     LFS_CANDIDATES+=("${SHA}")
                 fi
             done <<< "${ATTR_PARENTS}"
