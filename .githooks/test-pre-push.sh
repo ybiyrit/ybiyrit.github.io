@@ -5,7 +5,7 @@
 #
 # ---
 # name: test-pre-push
-# version: v1.25
+# version: v1.27
 # created: 2026-08-02
 # created_by: cl-bs
 # updated: 2026-10-02
@@ -88,6 +88,12 @@
 # git-lfs links the running bash and the hook's tools by resolved path.
 # v1.25 pins hook v1.26: a commit that drops LFS and adds a file, linear,
 # as a --no-ff side branch and as a new branch.
+# v1.26 pins hook v1.27: a pattern in double quotes is one field, so
+# filter=lfs inside it is no LFS use, while an unterminated quote or a
+# closing quote with an attribute right behind it still is.
+# v1.27 pins hook v1.28: one commit drops LFS and a later one adds the
+# pointer; the pointer fixture is a complete one, and each refusal must be
+# the LFS refusal.
 
 # a guard that blocks a legitimate push is worse than no guard, so the
 # suite asserts BOTH directions: real pushes stay allowed, planted
@@ -1455,6 +1461,58 @@ main() {
     rc="$(_rc env GIT_CONFIG_GLOBAL=/dev/null PATH="${ROOT}/nolfs-bin" git push -q origin main 2>"${ROOT}/n2")"
     _check "lfs on a pattern containing # refuses without git-lfs" 1 "${rc}"
 
+    # v1.26 (hook v1.27): a pattern in double quotes is one field under git's
+    # C quoting, so filter=lfs inside it sets nothing (git 2.53 check-attr:
+    # unspecified), while an attribute after the closing quote, and any
+    # attribute after an unterminated quote, still sets filter (copilot
+    # reviews of claude#9, fietsen#6 and files#7)
+    local QUOTED_LINE QUOTED_RC
+    for QUOTED_LINE in '0|"a filter=lfs b" text' '0|"x\"y filter=lfs" text' \
+        '1|"a b.bin" filter=lfs' '1|"a.bin"filter=lfs' '1|"unterminated filter=lfs' '1|"\101.bin" filter=lfs'; do
+        QUOTED_RC="${QUOTED_LINE%%|*}"
+        QUOTED_LINE="${QUOTED_LINE#*|}"
+        _setup_repo
+        git push -q origin main 2>/dev/null
+        printf '%s\n' "${QUOTED_LINE}" > .gitattributes
+        git add .gitattributes
+        git commit -qm "attributes behind a quoted pattern"
+        rc="$(_rc env GIT_CONFIG_GLOBAL=/dev/null PATH="${ROOT}/nolfs-bin" git push -q origin main 2>"${ROOT}/n7")"
+        _check "quoted pattern without git-lfs (expect rc ${QUOTED_RC}): ${QUOTED_LINE}" "${QUOTED_RC}" "${rc}"
+    done
+
+    # the hook parses the git grep lines, so the user's config must not
+    # reshape them: forced colour and a binary-flagged .gitattributes hid a
+    # real filter=lfs, and line numbers broke a quoted pattern (fable review
+    # of hook v1.27)
+    local SHAPE_CASE SHAPE_RC SHAPE_CFG
+    for SHAPE_CASE in colour binary linenumber; do
+        _setup_repo
+        git push -q origin main 2>/dev/null
+        SHAPE_CFG="${ROOT}/shape-${SHAPE_CASE}.gitconfig"
+        SHAPE_RC=1
+        printf '*.bin filter=lfs diff=lfs merge=lfs -text\n' > .gitattributes
+        case "${SHAPE_CASE}" in
+            colour) printf '[color]\n\tui = always\n\tgrep = always\n' > "${SHAPE_CFG}" ;;
+            binary)
+                : > "${SHAPE_CFG}"
+                printf '* -diff\n*.bin filter=lfs diff=lfs merge=lfs -text\n' > .gitattributes
+                ;;
+            linenumber)
+                printf '[grep]\n\tlineNumber = true\n\tcolumn = true\n' > "${SHAPE_CFG}"
+                printf '"a filter=lfs b" text\n' > .gitattributes
+                SHAPE_RC=0
+                ;;
+        esac
+        git add .gitattributes
+        git commit -qm "attributes read under ${SHAPE_CASE} config"
+        rc="$(_rc env GIT_CONFIG_GLOBAL="${SHAPE_CFG}" PATH="${ROOT}/nolfs-bin" git push -q origin main 2>"${ROOT}/n8")"
+        _check "git grep output reshaped by ${SHAPE_CASE} config (expect rc ${SHAPE_RC})" "${SHAPE_RC}" "${rc}"
+        # rc 1 is also guard_abort's status, so the refusal must be the LFS one
+        if (( SHAPE_RC == 1 )); then
+            _expect_output "the ${SHAPE_CASE} refusal names git-lfs" yes "git-lfs is not installed" "${ROOT}/n8"
+        fi
+    done
+
     # a push that only removes the LFS attributes uploads no LFS object: the
     # parent outside the range is no part of the push. the base goes up with
     # the fake git-lfs on PATH.
@@ -1470,19 +1528,25 @@ main() {
 
     # a commit that drops the LFS attributes AND adds a file still pushes an
     # LFS pointer under the published parent's attributes: linear, as a
-    # --no-ff side branch, and as a new branch (review of hook v1.25)
+    # --no-ff side branch, and as a new branch (review of hook v1.25), and
+    # with the drop and the pointer in two commits (copilot reviews of
+    # dhbw#18 and polder#7). the pointer carries all three fields of the
+    # spec; an oid of zeros keeps it clear of the token scan (polder#7)
     local LFS_SHAPE
-    for LFS_SHAPE in linear no-ff new-branch; do
+    for LFS_SHAPE in linear no-ff new-branch two-commit; do
         _setup_repo
         printf '*.bin filter=lfs diff=lfs merge=lfs -text\n' > .gitattributes
         git add .gitattributes
         git commit -qm "track binaries in lfs"
         env GIT_CONFIG_GLOBAL=/dev/null PATH="${ROOT}/fakebin:${PATH}" git push -q origin main 2>/dev/null
-        if [[ "${LFS_SHAPE}" != "linear" ]]; then
+        if [[ "${LFS_SHAPE}" == "no-ff" || "${LFS_SHAPE}" == "new-branch" ]]; then
             git switch -q -c side
         fi
         git rm -q .gitattributes
-        printf 'version https://git-lfs.github.com/spec/v1\n' > a.bin
+        if [[ "${LFS_SHAPE}" == "two-commit" ]]; then
+            git commit -qm "stop tracking binaries in lfs"
+        fi
+        printf 'version https://git-lfs.github.com/spec/v1\noid sha256:%064d\nsize 1\n' 0 > a.bin
         git add a.bin
         git commit -qm "drop lfs and add a pointer"
         if [[ "${LFS_SHAPE}" == "no-ff" ]]; then
@@ -1495,6 +1559,7 @@ main() {
         fi
         rc="$(_rc env GIT_CONFIG_GLOBAL=/dev/null PATH="${ROOT}/nolfs-bin" git push -q origin "${PUSH_REF}" 2>"${ROOT}/n6")"
         _check "dropping lfs while adding a file refuses without git-lfs: ${LFS_SHAPE}" 1 "${rc}"
+        _expect_output "the ${LFS_SHAPE} refusal names git-lfs" yes "git-lfs is not installed" "${ROOT}/n6"
     done
 
     # the .gitattributes walk is not capped at MAX_COMMITS: lfs in the oldest
@@ -1522,6 +1587,9 @@ main() {
     mkdir -p "${ROOT}/badparent-exec"
     ln -s "$(git --exec-path)"/* "${ROOT}/badparent-exec/"
     rm -f "${ROOT}/badparent-exec/git"
+    # the wrapper must keep $1, $2 and $@ literal; a lint at info level
+    # (bikeshed make lint) refused the single quotes (SC2016)
+    # shellcheck disable=SC2016
     printf '#!/bin/sh\nif [ "$1" = rev-parse ]; then case "$2" in *^@) exit 128 ;; esac; fi\nexec %q "$@"\n' \
         "$(command -v git)" > "${ROOT}/badparent-exec/git"
     chmod +x "${ROOT}/badparent-exec/git"

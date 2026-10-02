@@ -1,12 +1,22 @@
 #!/usr/bin/env bash
 # shellcheck shell=bash
-# commit-msg hook v1.2 created 2609 cl-bs updated 2610 cl-bs
+# commit-msg hook v1.5 created 2609 cl-bs updated 2610 cl-bs
 #
 # v1.1 skips a comment line only where git strips it ("#123 fix" with -m
 # read as an empty subject) and matches agent tokens as whole words (a
 # co-author named Devina was refused for "devin").
 # v1.2 refuses concatenated vendor names again (ClaudeCode, GitHubCopilot,
 # Claude4), which the v1.1 word boundary let through.
+# v1.3 builds the token patterns in the C locale (under tr_TR "i" upper-cased
+# to U+0130 and OpenAI passed), ends an all-caps token only at a non-letter
+# (DEVINA and PRECURSOR were refused), and reads the comment string from the
+# last of core.commentChar and core.commentString, as git does.
+# v1.4 matches the vendor compounds in AGENT_COMPOUNDS in any case:
+# claudecode and CLAUDECODE passed the boundary rules.
+# v1.5 ends a token that ends on a capital also before a capitalised word:
+# v1.3 let OpenAIAgent and ChatGPTAgent pass, which v1.2 refused. the
+# natural spellings OpenAI and ChatGPT end before anything but a lower-case
+# letter (OpenAIAPI passed).
 #
 # refuse a subject that records nothing, and refuse an
 # agent provenance trailer
@@ -55,8 +65,18 @@ MSG_FILE="$1"
 # known limits: a --cleanup flag is invisible to the hook, so only
 # commit.cleanup is read; under core.commentChar=auto (deprecated in git
 # 2.53) the chosen character is not knowable here, so no line is skipped.
+# core.commentChar and core.commentString set one value, and the last
+# assignment in config order wins (measured 2026-10-02, git 2.53, with
+# `git -c ... stripspace -s` in both orders); reading commentString first
+# gave it precedence it does not have.
 CLEANUP="$(git config --get commit.cleanup 2>/dev/null || true)"
-COMMENT="$(git config --get core.commentString 2>/dev/null || git config --get core.commentChar 2>/dev/null || true)"
+COMMENT_CONFIG="$(git config --get-regexp '^core\.comment(char|string)$' 2>/dev/null || true)"
+COMMENT="${COMMENT_CONFIG##*$'\n'}"
+if [[ "${COMMENT}" == *" "* ]]; then
+  COMMENT="${COMMENT#* }"
+else
+  COMMENT=""
+fi
 COMMENT="${COMMENT:-#}"
 STRIP=0
 if [[ "${CLEANUP}" == "strip" ]] \
@@ -125,36 +145,82 @@ fi
 # tokens are not matched as bare substrings, so "devin" no longer refuses a
 # human co-author named Devina; agent_named() holds the boundaries.
 AGENT_TOKENS='claude|anthropic|copilot|gemini|antigravity|mistral|vibe|openai|chatgpt|codex|cursor|devin|aider|windsurf'
+# vendor names written as one word. in one case throughout they cannot be
+# told apart from a word that contains a token (claudecode against devina),
+# so the known ones are listed and match in any case between non-letters
+# (copilot review of dhbw#18).
+AGENT_COMPOUNDS='claudecode|githubcopilot|copilotcli|openaicodex|codexcli|geminicli|mistralvibe|devinai|cursoragent'
+# the tokens whose usual spelling ends in a capital, in that exact case. a
+# human name in capitals cannot start with this mixed case, so they take the
+# lower-case boundary: OpenAIAPI and ChatGPTAPI passed the capital boundary
+# (fable review of v1.5).
+readonly AGENT_NATURAL='OpenAI|ChatGPT'
 
 # each token spelled case-insensitively, one bracket per letter, because
-# agent_named() matches case-sensitively. AGENT_CAP requires an upper-case
-# first letter, for a token that starts inside a word (GitHubCopilot).
-AGENT_CI=""
-AGENT_CAP=""
-IFS='|' read -r -a TOKEN_ARRAY <<<"${AGENT_TOKENS}"
-for TOKEN in "${TOKEN_ARRAY[@]}"; do
-  REST=""
-  for (( I = 1; I < ${#TOKEN}; I++ )); do
-    C="${TOKEN:I:1}"
-    REST+="[${C,,}${C^^}]"
+# agent_named() matches case-sensitively. AGENT_LOW ends on a lower-case
+# letter and AGENT_UP on an upper-case one, so each takes its own right
+# boundary. AGENT_CAP is the capitalised word (Copilot), for a token that
+# starts inside a word (GitHubCopilot).
+# built in the C locale: ${C^^} follows the caller's locale, and under tr_TR
+# "i" upper-cases to U+0130, so OpenAI and GEMINI passed (measured
+# 2026-10-02, bash 5.3, a tr_TR.UTF-8 built with localedef). AGENT_ANY
+# spells each compound in any case.
+build_agent_patterns() {
+  local LC_ALL=C TOKEN BODY I C LAST
+  local -a TOKEN_ARRAY
+  AGENT_LOW=""
+  AGENT_UP=""
+  AGENT_CAP=""
+  AGENT_ANY=""
+  IFS='|' read -r -a TOKEN_ARRAY <<<"${AGENT_TOKENS}"
+  for TOKEN in "${TOKEN_ARRAY[@]}"; do
+    BODY=""
+    for (( I = 0; I < ${#TOKEN} - 1; I++ )); do
+      C="${TOKEN:I:1}"
+      BODY+="[${C,,}${C^^}]"
+    done
+    LAST="${TOKEN: -1}"
+    AGENT_LOW+="${AGENT_LOW:+|}${BODY}${LAST,,}"
+    AGENT_UP+="${AGENT_UP:+|}${BODY}${LAST^^}"
+    C="${TOKEN:0:1}"
+    AGENT_CAP+="${AGENT_CAP:+|}${C^^}${TOKEN:1}"
   done
-  FIRST="${TOKEN:0:1}"
-  AGENT_CI+="${AGENT_CI:+|}[${FIRST,,}${FIRST^^}]${REST}"
-  AGENT_CAP+="${AGENT_CAP:+|}${FIRST^^}${REST}"
-done
-readonly AGENT_CI AGENT_CAP
+  IFS='|' read -r -a TOKEN_ARRAY <<<"${AGENT_COMPOUNDS}"
+  for TOKEN in "${TOKEN_ARRAY[@]}"; do
+    BODY=""
+    for (( I = 0; I < ${#TOKEN}; I++ )); do
+      C="${TOKEN:I:1}"
+      BODY+="[${C,,}${C^^}]"
+    done
+    AGENT_ANY+="${AGENT_ANY:+|}${BODY}"
+  done
+}
+build_agent_patterns
+readonly AGENT_LOW AGENT_UP AGENT_CAP AGENT_ANY
 
-# agent_named TEXT: true when TEXT names an agent token. the right boundary
-# is "not a lower-case letter": v1.1 required a non-alphanumeric there, so
-# ClaudeCode and Claude4 passed, while Devina (a lower-case continuation)
-# must pass. on the left, a token starts the text or follows a non-letter,
-# or starts with a capital inside a word (GitHubCopilot, OpenAICodex); a
-# lower-case run such as "precursor" is no agent name. C locale: [a-z] is
-# ascii lower case only.
+# agent_named TEXT: true when TEXT names an agent token. a token that ends
+# on a lower-case letter ends before anything but a lower-case letter: v1.1
+# required a non-alphanumeric there, so ClaudeCode and Claude4 passed, while
+# Devina (a lower-case continuation) must pass. a token that ends on a
+# capital ends before a non-letter or before a capitalised word, so DEVINA
+# passes while CLAUDE4 and OpenAIAgent do not (v1.5; v1.3 required a
+# non-letter and let OpenAIAgent through, copilot review of talks#180). on
+# the left, a token starts the text or follows a non-letter, or
+# starts a capitalised word inside a word (GitHubCopilot, OpenAICodex); a
+# run such as "precursor" or "PRECURSOR" is no agent name. a compound from
+# AGENT_COMPOUNDS fails in any case. known limit: any other concatenation
+# in one case (CLAUDEBOT, claudebot) passes, because it cannot be told from
+# a name that contains a token (DEVINA), and so does a natural spelling
+# with a lower-case continuation (ChatGPTs, OpenAIo3); a vendor address in
+# the same trailer (noreply@anthropic.com) still fails.
+# C locale: [a-z] is ascii lower case only.
 agent_named() {
   local LC_ALL=C
-  [[ "${1}" =~ (^|[^[:alpha:]])(${AGENT_CI})([^a-z]|$) ]] \
-    || [[ "${1}" =~ [[:alpha:]](${AGENT_CAP})([^a-z]|$) ]]
+  [[ "${1}" =~ (^|[^[:alpha:]])(${AGENT_LOW})([^a-z]|$) ]] \
+    || [[ "${1}" =~ (^|[^[:alpha:]])(${AGENT_UP})([^[:alpha:]]|[A-Z][a-z]|$) ]] \
+    || [[ "${1}" =~ [[:alpha:]](${AGENT_CAP})([^a-z]|$) ]] \
+    || [[ "${1}" =~ (^|[^[:alpha:]])(${AGENT_ANY})([^[:alpha:]]|$) ]] \
+    || [[ "${1}" =~ (^|[^[:alpha:]])(${AGENT_NATURAL})([^a-z]|$) ]]
 }
 
 fail_provenance() {
