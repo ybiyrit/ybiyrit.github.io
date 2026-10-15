@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # shellcheck shell=bash
-# commit-msg hook v1.5 created 2609 cl-bs updated 2610 cl-bs
+# commit-msg hook v1.5 created 2609 bs-bs updated 2610 bs-bs
 #
 # v1.1 skips a comment line only where git strips it ("#123 fix" with -m
 # read as an empty subject) and matches agent tokens as whole words (a

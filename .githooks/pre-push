@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # shellcheck shell=bash
-# pre-push hook v1.28 created 2605 cl-bs updated 2610 cl-bs
+# pre-push hook v1.28 created 2605 bs-bs updated 2610 bs-bs
 #
 # universal pre-push guard. four independent checks, all fail closed:
 #

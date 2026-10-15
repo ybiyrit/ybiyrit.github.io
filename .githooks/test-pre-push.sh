@@ -7,9 +7,9 @@
 # name: test-pre-push
 # version: v1.27
 # created: 2026-08-02
-# created_by: cl-bs
+# created_by: bs-bs
 # updated: 2026-10-02
-# updated_by: cl-bs
+# updated_by: bs-bs
 # description: regression suite for the pre-push hook; proves in throwaway repositories that real pushes pass and planted secrets, secret-shaped names and leaky remotes are blocked
 # type: test
 # ---
