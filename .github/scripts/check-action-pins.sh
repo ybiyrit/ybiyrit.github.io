@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # vi: ft=bash ts=4 sw=4 et
 # shellcheck shell=bash
-# check-action-pins.sh v1.0 created 2607 cl-bs
+# check-action-pins.sh v1.0 created 2607 bs-bs
 # SPDX-License-Identifier: Apache-2.0
 #
 # Enforces the GitHub Actions pinning discipline from research-general

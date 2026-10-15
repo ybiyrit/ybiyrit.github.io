@@ -7,9 +7,9 @@
 # name: test-commit-msg
 # version: v1.11.1
 # created: 2026-09-08
-# created_by: cl-bs
+# created_by: bs-bs
 # updated: 2026-10-02
-# updated_by: cl-bs
+# updated_by: bs-bs
 # description: fixture suite for the commit-msg hook; proves each agent token, watermark shape and subject rule is refused for its own reason and that ordinary messages pass
 # type: test
 # ---
