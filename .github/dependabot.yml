@@ -6,6 +6,15 @@ updates:
       interval: "weekly"
       day: "monday"
     open-pull-requests-limit: 5
+    # hold a release back for 14 days, the floor of the global 2 to 4 week
+    # cool-off. without this key dependabot holds for 3 days only; security
+    # updates bypass the cool-off either way.
+    cooldown:
+      default-days: 14
+      # owner exception of 2026-11-20, open-ended ("for now"): the claude
+      # code action updates without a cool-off. remove the entry to end it.
+      exclude:
+        - "anthropics/claude-code-action"
     labels:
       - "dependencies"
       - "github-actions"
